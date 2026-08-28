@@ -34,11 +34,13 @@ if(LLVM)
   endif()
 endif()
 
-add_custom_target(
-  lean
-  ALL
-  WORKING_DIRECTORY ${LEAN_SOURCE_DIR}
-  DEPENDS leanshared leanmain
-  COMMAND $(MAKE) -f ${CMAKE_BINARY_DIR}/stdlib.make lean
-  COMMAND_EXPAND_LISTS
-)
+if(NOT LEAN_WASM_STANDALONE)
+  add_custom_target(
+    lean
+    ALL
+    WORKING_DIRECTORY ${LEAN_SOURCE_DIR}
+    DEPENDS leanshared leanmain
+    COMMAND $(MAKE) -f ${CMAKE_BINARY_DIR}/stdlib.make lean
+    COMMAND_EXPAND_LISTS
+  )
+endif()
