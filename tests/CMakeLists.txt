@@ -349,6 +349,13 @@ add_dir_of_test_dirs(
     user_ext # Test started being nondeterministic
 )
 
+# WASM-specific tests: only registered for Emscripten builds.
+# Uses node to run lean.js instead of the native lean binary.
+if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+  add_test_pile(wasm *.lean)
+  add_test_pile(wasm *.sh)
+endif()
+
 #######################
 ## Benchmark targets ##
 #######################

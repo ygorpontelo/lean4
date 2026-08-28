@@ -23,7 +23,10 @@ extern "C" void initialize_libuv() {
     initialize_libuv_signal();
     initialize_libuv_loop();
 
+#if defined(LEAN_MULTI_THREAD)
+    // Without multi-threading, the event loop would block the main thread.
     lthread([]() { event_loop_run_loop(&global_ev); });
+#endif
 }
 
 extern "C" LEAN_EXPORT char ** lean_setup_args(int argc, char ** argv) {

@@ -25,6 +25,9 @@ Authors: Leonardo de Moura, Sebastian Ullrich
 #ifndef LEAN_EMSCRIPTEN
 #include <sys/random.h>
 #endif
+#if defined(LEAN_WASM_COMPONENT)
+#include <wasi/api.h>
+#endif
 #endif
 #ifndef LEAN_WINDOWS
 #include <csignal>
@@ -874,6 +877,29 @@ extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
 
     if (nbytes == 0) return io_result_mk_ok(lean_alloc_sarray(1, 0, 0));
 
+#if defined(LEAN_WASM_COMPONENT)
+    // STANDALONE_WASM has no /dev/urandom; use the WASI random_get import.
+    if (lean_alloc_sarray_would_overflow(1, nbytes)) {
+        return io_result_mk_error(decode_io_error(ENOMEM, NULL));
+    }
+    obj_res res = lean_alloc_sarray(1, 0, nbytes);
+    uint8_t *dst = lean_sarray_cptr(res);
+    size_t remain = nbytes;
+    // WASI random_get may limit each call; chunk to 65536 bytes like the Emscripten path.
+    while (remain > 0) {
+        size_t read_sz = remain < 65536 ? remain : 65536;
+        __wasi_errno_t err = __wasi_random_get(dst, read_sz);
+        if (err != 0) {
+            dec_ref(res);
+            return io_result_mk_error(decode_io_error(static_cast<int>(err), nullptr));
+        }
+        remain -= read_sz;
+        dst += read_sz;
+    }
+    lean_sarray_set_size(res, nbytes);
+    return io_result_mk_ok(res);
+#else
+
 #if !defined(LEAN_WINDOWS)
     int fd_urandom = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd_urandom < 0) {
@@ -930,6 +956,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_get_random_bytes (size_t nbytes) {
 #endif
     lean_sarray_set_size(res, nbytes);
     return io_result_mk_ok(res);
+#endif
 }
 
 /* timeit {α : Type} (msg : @& String) (fn : IO α) : IO α */
@@ -978,7 +1005,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_getenv(b_obj_arg env_var) {
     if (strlen(env_var_str) != lean_string_size(env_var) - 1) {
         return mk_option_none();
     }
-#if defined(LEAN_EMSCRIPTEN)
+#if defined(LEAN_EMSCRIPTEN) && !defined(LEAN_WASM_COMPONENT)
     // HACK(WN): getenv doesn't seem to work in Emscripten even though it should
     // see https://emscripten.org/docs/porting/connecting_cpp_and_javascript/Interacting-with-code.html#interacting-with-code-environment-variables
     char* val = reinterpret_cast<char*>(EM_ASM_INT({
@@ -1258,7 +1285,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_hard_link(b_obj_arg orig, b_obj_arg link)
 }
 
 /* createTempFile : IO (Handle × FilePath) */
-extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
+extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile() {
     char path[PATH_MAX];
     size_t base_len = PATH_MAX;
     int ret = uv_os_tmpdir(path, &base_len);
@@ -1304,7 +1331,7 @@ extern "C" LEAN_EXPORT obj_res lean_io_create_tempfile(lean_object * /* w */) {
 }
 
 /* createTempDir : IO FilePath */
-extern "C" LEAN_EXPORT obj_res lean_io_create_tempdir(lean_object * /* w */) {
+extern "C" LEAN_EXPORT obj_res lean_io_create_tempdir() {
     char path[PATH_MAX];
     size_t base_len = PATH_MAX;
     int ret = uv_os_tmpdir(path, &base_len);
@@ -1384,13 +1411,12 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
     if (!realpath(buf1, buf2))
         return io_result_mk_error("failed to resolve symbolic links when locating application");
     return io_result_mk_ok(mk_string(buf2));
-#elif defined(LEAN_EMSCRIPTEN)
+#elif defined(LEAN_EMSCRIPTEN) && !defined(LEAN_WASM_COMPONENT)
     // See https://emscripten.org/docs/api_reference/emscripten.h.html#c.EM_ASM_INT
     char* appPath = reinterpret_cast<char*>(EM_ASM_INT({
         if ((typeof process === "undefined") || (process.release.name !== "node")) {
             return 0;
         }
-
         var lengthBytes = lengthBytesUTF8(__filename)+1;
         var pathOnWasmHeap = _malloc(lengthBytes);
         stringToUTF8(__filename, pathOnWasmHeap, lengthBytes);
@@ -1399,10 +1425,27 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
     if (appPath == nullptr) {
         return io_result_mk_error("no Lean executable file exists in WASM outside of Node.js");
     }
-
     object * appPathLean = mk_string(appPath);
     free(appPath);
     return io_result_mk_ok(appPathLean);
+#elif defined(LEAN_WASM_COMPONENT)
+    // STANDALONE_WASM under Node.js: read __filename into a stack buffer
+    // without using _malloc (not available as a JS global in this mode).
+    char buf[PATH_MAX];
+    int len = EM_ASM_INT({
+        if ((typeof process === "undefined") || (process.release.name !== "node")) {
+            return 0;
+        }
+        var s = __filename;
+        var n = lengthBytesUTF8(s);
+        if (n >= $0) return -1;
+        stringToUTF8(s, $1, n + 1);
+        return n;
+    }, (int)sizeof(buf), buf);
+    if (len <= 0) {
+        return io_result_mk_error("no app path in WASM component mode");
+    }
+    return io_result_mk_ok(mk_string(buf));
 #else
     // Linux version
     char path[PATH_MAX];

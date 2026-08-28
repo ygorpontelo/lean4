@@ -555,196 +555,220 @@ extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_available_memory() {
 }
 
 #else
+// Emscripten provides POSIX functions via the WASI sysroot.
+// These implementations use standard POSIX APIs instead of libuv.
+#include <unistd.h>
+#include <time.h>
+#include <cstdlib>
+#include <cerrno>
+#include <sys/utsname.h>
+#include <sys/resource.h>
+extern "C" char **environ;
 
 // Std.Internal.UV.System.getProcessTitle : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_process_title() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_mk_string("lean"));
 }
 
 // Std.Internal.UV.System.setProcessTitle : @& String → IO Unit
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_set_process_title(b_obj_arg title) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_set_process_title(b_obj_arg /*title*/) {
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.uptime : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_uptime() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)ts.tv_sec));
 }
 
 // Std.Internal.UV.System.osGetPid : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getpid() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)getpid()));
 }
 
 // Std.Internal.UV.System.osGetPpid : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getppid() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)getppid()));
 }
 
 // Std.Internal.UV.System.cpuInfo : IO (Array CPUInfo)
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_cpu_info() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    lean_object * arr = lean_mk_empty_array();
+    return lean_io_result_mk_ok(arr);
 }
 
 // Std.Internal.UV.System.cwd : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_cwd() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    char buf[4096];
+    if (getcwd(buf, sizeof(buf)) == nullptr) {
+        return lean_io_result_mk_error(lean_mk_io_error_other_error(errno, nullptr));
+    }
+    return lean_io_result_mk_ok(lean_mk_string(buf));
 }
 
 // Std.Internal.UV.System.chdir : String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_chdir(b_obj_arg path) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    if (chdir(lean_string_cstr(path)) != 0) {
+        return lean_io_result_mk_error(lean_mk_io_error_other_error(errno, path));
+    }
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osHomedir : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_homedir() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    const char * home = getenv("HOME");
+    if (!home) home = "/";
+    return lean_io_result_mk_ok(lean_mk_string(home));
 }
 
 // Std.Internal.UV.System.osTmpdir : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_tmpdir() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    const char * tmp = getenv("TMPDIR");
+    if (!tmp) tmp = "/tmp";
+    return lean_io_result_mk_ok(lean_mk_string(tmp));
 }
 
 // Std.Internal.UV.System.osGetPasswd : IO PasswdInfo
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_passwd() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_error(lean_mk_io_error_other_error(ENOSYS, nullptr));
 }
 
 // Std.Internal.UV.System.osGetGroup : IO (Option GroupInfo)
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_group() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_get_group(uint64_t /*gid*/) {
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osEnviron : IO (Array (String × String))
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_environ() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    lean_object * arr = lean_mk_empty_array();
+    for (char ** env = environ; *env; env++) {
+        char * eq = strchr(*env, '=');
+        if (eq) {
+            lean_object * pair = lean_alloc_ctor(0, 2, 0);
+            lean_ctor_set(pair, 0, lean_mk_string_from_bytes(*env, eq - *env));
+            lean_ctor_set(pair, 1, lean_mk_string(eq + 1));
+            arr = lean_array_push(arr, pair);
+        }
+    }
+    return lean_io_result_mk_ok(arr);
 }
 
 // Std.Internal.UV.System.osGetenv : @& String → IO (Option String)
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getenv(b_obj_arg name) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    const char * val = getenv(lean_string_cstr(name));
+    if (val) {
+        lean_object * some = lean_alloc_ctor(1, 1, 0);
+        lean_ctor_set(some, 0, lean_mk_string(val));
+        return lean_io_result_mk_ok(some);
+    }
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osSetenv : @& String → @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setenv(b_obj_arg name, b_obj_arg value) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    setenv(lean_string_cstr(name), lean_string_cstr(value), 1);
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osUnsetenv : @& String → IO Unit
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_unsetenv(b_obj_arg name) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    unsetenv(lean_string_cstr(name));
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osGetHostname : IO String
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_gethostname() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    char buf[256] = {};
+    if (gethostname(buf, sizeof(buf) - 1) != 0) {
+        buf[0] = '\0';
+    }
+    return lean_io_result_mk_ok(lean_mk_string(buf));
 }
 
 // Std.Internal.UV.System.osGetPriority : UInt64 → IO Int
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getpriority(uint64_t pid) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_getpriority(uint64_t /*pid*/) {
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osSetPriority : UInt64 → Int → IO Unit
-extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setpriority(uint64_t pid, int64_t priority) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_setpriority(uint64_t /*pid*/, int64_t /*priority*/) {
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 // Std.Internal.UV.System.osUname : IO UnameInfo
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_os_uname() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    struct utsname buf;
+    uname(&buf);
+    lean_object * uname = lean_alloc_ctor(0, 4, 0);
+    lean_ctor_set(uname, 0, lean_mk_string(buf.sysname));
+    lean_ctor_set(uname, 1, lean_mk_string(buf.release));
+    lean_ctor_set(uname, 2, lean_mk_string(buf.version));
+    lean_ctor_set(uname, 3, lean_mk_string(buf.machine));
+    return lean_io_result_mk_ok(uname);
 }
 
 // Std.Internal.UV.System.hrtime : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_hrtime() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return lean_io_result_mk_ok(lean_box_uint64((uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec));
 }
 
 // Std.Internal.UV.System.random : UInt64 → IO (IO.Promise (Except IO.Error (Array UInt8)))
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_random(uint64_t size) {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_error(lean_mk_io_error_other_error(ENOSYS, nullptr));
 }
 
 // Std.Internal.UV.System.getrusage : IO RUsage
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_getrusage() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    lean_object * r = lean_alloc_ctor(0, 0, 16 * sizeof(uint64_t));
+    lean_ctor_set_uint64(r, 0 * sizeof(uint64_t), (uint64_t)ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000);
+    lean_ctor_set_uint64(r, 1 * sizeof(uint64_t), (uint64_t)ru.ru_stime.tv_sec * 1000 + ru.ru_stime.tv_usec / 1000);
+    lean_ctor_set_uint64(r, 2 * sizeof(uint64_t), (uint64_t)ru.ru_maxrss);
+    lean_ctor_set_uint64(r, 3 * sizeof(uint64_t), (uint64_t)ru.ru_ixrss);
+    lean_ctor_set_uint64(r, 4 * sizeof(uint64_t), (uint64_t)ru.ru_idrss);
+    lean_ctor_set_uint64(r, 5 * sizeof(uint64_t), (uint64_t)ru.ru_isrss);
+    lean_ctor_set_uint64(r, 6 * sizeof(uint64_t), (uint64_t)ru.ru_minflt);
+    lean_ctor_set_uint64(r, 7 * sizeof(uint64_t), (uint64_t)ru.ru_majflt);
+    lean_ctor_set_uint64(r, 8 * sizeof(uint64_t), (uint64_t)ru.ru_nswap);
+    lean_ctor_set_uint64(r, 9 * sizeof(uint64_t), (uint64_t)ru.ru_inblock);
+    lean_ctor_set_uint64(r, 10 * sizeof(uint64_t), (uint64_t)ru.ru_oublock);
+    lean_ctor_set_uint64(r, 11 * sizeof(uint64_t), (uint64_t)ru.ru_msgsnd);
+    lean_ctor_set_uint64(r, 12 * sizeof(uint64_t), (uint64_t)ru.ru_msgrcv);
+    lean_ctor_set_uint64(r, 13 * sizeof(uint64_t), (uint64_t)ru.ru_nsignals);
+    lean_ctor_set_uint64(r, 14 * sizeof(uint64_t), (uint64_t)ru.ru_nvcsw);
+    lean_ctor_set_uint64(r, 15 * sizeof(uint64_t), (uint64_t)ru.ru_nivcsw);
+    return lean_io_result_mk_ok(r);
 }
+
 // Std.Internal.UV.System.exePath : IO String
+// Stub: returns a fixed path. Under NODERAWFS, /proc/self/exe or readlink
+// would be more accurate, but the wasm binary path is not meaningful here.
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_exepath() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_mk_string("/lean.js"));
 }
+
 // Std.Internal.UV.System.freeMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_free_memory() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_box_uint64(0));
 }
+
 // Std.Internal.UV.System.totalMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_total_memory() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_box_uint64(0));
 }
+
 // Std.Internal.UV.System.constrainedMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_constrained_memory() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_box_uint64(0));
 }
+
 // Std.Internal.UV.System.availableMemory : IO UInt64
 extern "C" LEAN_EXPORT lean_obj_res lean_uv_get_available_memory() {
-    lean_always_assert(
-        false && ("Please build a version of Lean4 with libuv to invoke this.")
-    );
+    return lean_io_result_mk_ok(lean_box_uint64(0));
 }
 
 #endif

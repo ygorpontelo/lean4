@@ -29,9 +29,12 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include <string>
 #include <vector>
 #include <shared_mutex>
+#include <mutex>
 #ifdef LEAN_WINDOWS
 #include <windows.h>
 #include <psapi.h>
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten/em_asm.h>
 #else
 #include <dlfcn.h>
 #endif
@@ -357,6 +360,30 @@ void * lookup_symbol_in_cur_exe(char const * sym) {
         }
     }
     return nullptr;
+#elif defined(__EMSCRIPTEN__)
+    // Look up a symbol in the wasm module exports. Function exports are
+    // inserted into the indirect function table and the resulting table
+    // index is returned (usable via call_indirect). Wasm globals (data
+    // symbols) are returned as their numeric value, matching how dlsym
+    // returns a pointer to data on native platforms. We grow and set the
+    // table directly because addFunction is not in scope from EM_ASM under
+    // -pthread.
+    return reinterpret_cast<void *>(EM_ASM_INT({
+        var name = UTF8ToString($0);
+        if (name[0] == '_') name = name.slice(1);
+        var sym = wasmExports[name];
+        if (!sym) return 0;
+        if (typeof sym === 'function') {
+            var idx = wasmTable.length;
+            wasmTable.grow(1);
+            wasmTable.set(idx, sym);
+            return idx;
+        }
+        if (sym && typeof sym.value !== 'undefined') {
+            return Number(sym.value);
+        }
+        return 0;
+    }, sym));
 #else
     return dlsym(RTLD_DEFAULT, sym);
 #endif
@@ -1209,7 +1236,7 @@ extern "C" LEAN_EXPORT obj_res lean_run_mod_init_core(b_obj_arg  sym) {
     }
 }
 
-extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, object * decl, object * init_decl, object *) {
+extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, object * decl, object * init_decl) {
     return interpreter::with_interpreter<object *>(TO_REF(elab_environment, env), TO_REF(options, opts), TO_REF(name, decl), [&](interpreter & interp) {
         return interp.run_init(TO_REF(name, decl), TO_REF(name, init_decl));
     });

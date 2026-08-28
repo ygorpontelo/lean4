@@ -129,7 +129,8 @@ struct olean_header {
     // 40 bytes: build githash, padded with `\0` to the right
     char githash[40];
     // address at which the beginning of the file (including header) is attempted to be mmapped
-    size_t base_addr;
+    // Use fixed 64-bit width so .olean files are cross-architecture compatible.
+    uint64_t base_addr;
     // In v3, the fixed header is followed by these length-prefixed sections:
     //   size_t   data_size                                // byte length of the compacted data
     //   compacted data                                    // `data_size` bytes
@@ -140,8 +141,7 @@ struct olean_header {
     // In v2, the compacted data starts immediately after the header (no `data_size`, no sections).
     size_t data[];
 };
-// make sure we don't have any padding bytes, which also ensures `data` is properly aligned
-static_assert(sizeof(olean_header) == 5 + 1 + 1 + 33 + 40 + sizeof(size_t), "olean_header must be packed");
+static_assert(sizeof(olean_header) == 5 + 1 + 1 + 33 + 40 + sizeof(uint64_t), "olean_header must be packed");
 
 
 // Compactor external object: wraps a live `object_compactor` for incremental compaction.

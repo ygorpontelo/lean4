@@ -86,8 +86,10 @@ void enable_debug_dialog(bool flag) {
 }
 
 void invoke_debugger() {
-#if defined(LEAN_EMSCRIPTEN)
+#if defined(LEAN_EMSCRIPTEN) && !defined(LEAN_WASM_COMPONENT)
     EM_ASM(debugger;);
+    exit(1);
+#elif defined(LEAN_WASM_COMPONENT)
     exit(1);
 #else
     g_has_violations = true;

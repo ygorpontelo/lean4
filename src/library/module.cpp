@@ -129,7 +129,8 @@ struct olean_header {
     // 40 bytes: build githash, padded with `\0` to the right
     char githash[40];
     // address at which the beginning of the file (including header) is attempted to be mmapped
-    size_t base_addr;
+    // Use fixed 64-bit width so .olean files are cross-architecture compatible.
+    uint64_t base_addr;
     // In v3, the fixed header is followed by these length-prefixed sections:
     //   size_t   data_size                                // byte length of the compacted data
     //   compacted data                                    // `data_size` bytes
@@ -141,7 +142,7 @@ struct olean_header {
     size_t data[];
 };
 // make sure we don't have any padding bytes, which also ensures `data` is properly aligned
-static_assert(sizeof(olean_header) == 5 + 1 + 1 + 33 + 40 + sizeof(size_t), "olean_header must be packed");
+static_assert(sizeof(olean_header) == 5 + 1 + 1 + 33 + 40 + sizeof(uint64_t), "olean_header must be packed");
 
 
 // Compactor external object: wraps a live `object_compactor` for incremental compaction.
@@ -267,7 +268,7 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
 
 extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
                                                            b_obj_arg odep_regions, obj_arg oprev,
-                                                           uint8 allow_closures_u8, object *) {
+                                                           uint8 allow_closures_u8) {
     // `mmap` addresses must be page-aligned. The default (non-huge) page size on x86-64 is 4KB;
     // `MapViewOfFileEx` addresses must be aligned to the "memory allocation granularity" (64KB).
     const size_t ALIGN = 1LL<<16;
@@ -449,7 +450,7 @@ static object * mk_compacted_region(b_obj_arg ofname, object * root,
 // root to be interpreted as — the C side does no type checking and the caller is responsible for
 // using a type compatible with what was saved (see `CompactedRegion.read`).
 // Supports both `v2` and `v3` formats.
-extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions, object *) {
+extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_obj_arg odep_regions) {
     std::string olean_fn(lean_string_cstr(ofname));
     try {
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
@@ -618,7 +619,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
     }
 }
 
-extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region, object *) {
+extern "C" LEAN_EXPORT obj_res lean_compacted_region_free(obj_arg region) {
     char * buffer = region_buffer(region);
     size_t full_sz = region_size(region);
     bool is_mmap = lean_ctor_get_uint8(region, sizeof(void*) * 5) != 0;

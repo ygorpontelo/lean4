@@ -112,6 +112,7 @@ option(USE_GMP "USE_GMP" ON)
 # When ON, build against whatever GMP is available even if it is older than 6.3.0.
 option(FORCE_GMP "Build against the available GMP even if older than the required 6.3.0" OFF)
 option(USE_MIMALLOC "use mimalloc" ON)
+option(LEAN_WASM_COMPONENT "Build for WASM component model (STANDALONE_WASM, no pthreads)" OFF)
 set(LEAN_MI_SECURE 0 CACHE STRING "Configure mimalloc memory safety mitigations (https://github.com/microsoft/mimalloc/blob/v2.2.7/include/mimalloc/types.h#L56-L60)")
 
 # development-specific options
@@ -177,9 +178,18 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
 
   # From https://emscripten.org/docs/compiling/WebAssembly.html#backends:
   # > The simple and safe thing is to pass all -s flags at both compile and link time.
-  set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -flto")
-  string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
-  string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN ${EMSCRIPTEN_SETTINGS}")
+  if(LEAN_WASM_COMPONENT)
+    # WASM component mode: NODERAWFS for node.js filesystem access.
+    # Use -pthread with PTHREAD_POOL_SIZE for the Lean task manager.
+    # STANDALONE_WASM is incompatible with NODERAWFS; use NODERAWFS for testing under node.js.
+    set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -s PTHREAD_POOL_SIZE=4 -s NODERAWFS")
+    string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
+    string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN -D LEAN_WASM_COMPONENT -D LEAN_MULTI_THREAD ${EMSCRIPTEN_SETTINGS}")
+  else()
+    set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -flto")
+    string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
+    string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN ${EMSCRIPTEN_SETTINGS}")
+  endif()
   string(APPEND LEAN_EXTRA_LINKER_FLAGS " ${EMSCRIPTEN_SETTINGS}")
 endif()
 
@@ -531,7 +541,7 @@ endif()
 
 set(LEAN_CXX_STDLIB "-lstdc++" CACHE STRING "C++ stdlib linker flags")
 
-if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+if(CMAKE_SYSTEM_NAME MATCHES "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   set(LEAN_CXX_STDLIB "-lc++")
 endif()
 
@@ -904,10 +914,23 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   # We set `ERROR_ON_UNDEFINED_SYMBOLS=0` because our build of LibUV does not
   # define all symbols, see the comment about LibUV on WebAssembly further up
   # in this file.
-  string(
-    APPEND LEAN_EXE_LINKER_FLAGS
-    " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} ${EMSCRIPTEN_SETTINGS} -lnodefs.js -s EXIT_RUNTIME=1 -s MAIN_MODULE=1 -s LINKABLE=1 -s EXPORT_ALL=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0"
-  )
+  if(LEAN_WASM_COMPONENT)
+    # WASM component mode: use EM_ASM to look up symbols in the wasm export
+    # table instead of dlsym (which requires MAIN_MODULE=1). Export all
+    # symbols and force-include Lean static libraries via --whole-archive so the
+    # interpreter can find extern wrappers at runtime. Only the Lean libraries
+    # are wrapped in --whole-archive; libc++ and nodefs.js stay outside to avoid
+    # duplicate symbol errors and unnecessary bloat.
+    string(
+      APPEND LEAN_EXE_LINKER_FLAGS
+      " ${LIB}/temp/libleanshell.a -Wl,--whole-archive -lleancpp -lInit -lStd -lLean -lleanrt -Wl,--no-whole-archive ${EMSCRIPTEN_SETTINGS} -lnodefs.js -lc++ -lexports.js -s EXIT_RUNTIME=1 -s DEFAULT_TO_CXX -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s ALLOW_TABLE_GROWTH=1 -Wl,--export-all"
+    )
+  else()
+    string(
+      APPEND LEAN_EXE_LINKER_FLAGS
+      " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} ${EMSCRIPTEN_SETTINGS} -lnodefs.js -s EXIT_RUNTIME=1 -s MAIN_MODULE=1 -s LINKABLE=1 -s EXPORT_ALL=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0"
+    )
+  endif()
 endif()
 
 # Build the compiler using the bootstrapped C sources for stage0, and use
@@ -924,6 +947,9 @@ set(
   Leanc
   LeanIR
 )
+if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+  list(REMOVE_ITEM STDLIBS Leanc)
+endif()
 if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   list(APPEND STDLIBS Lake LeanChecker)
 endif()
@@ -1180,6 +1206,34 @@ else()
   set(CMAKE_BUILD_TYPE_TOML "Release")
 endif()
 
+if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+  set(LAKE_DEFAULT_TARGETS_EXTRA ", \"LeanIR\"")
+  set(LAKE_LAKE_LIB_ENTRIES "")
+  set(LAKE_LEANC_LIB_ENTRY "")
+  set(LAKE_LEANCHECKER_LIB_ENTRY "")
+else()
+  set(LAKE_DEFAULT_TARGETS_EXTRA ", \"Lake\", \"LakeMain\", \"LeanIR\", \"Leanc\", \"LeanChecker\"")
+  string(CONCAT LAKE_LAKE_LIB_ENTRIES
+    "[[lean_lib]]\n"
+    "name = \"Lake\"\n"
+    "srcDir = \"lake\"\n"
+    "globs = [\"Lake.*\"]\n"
+    "defaultFacets = [\"static\", \"static.export\"]\n"
+    "weakLeanArgs = [\"--plugin\", \"${PREV_STAGE}/${CMAKE_RELATIVE_LIBRARY_OUTPUT_DIRECTORY}/libLake_shared${CMAKE_SHARED_LIBRARY_SUFFIX}=initialize_Lake_All\"]\n"
+    "\n"
+    "[[lean_lib]]\n"
+    "name = \"LakeMain\"\n"
+    "srcDir = \"lake\"\n"
+    "defaultFacets = [\"static.export\"]")
+  string(CONCAT LAKE_LEANC_LIB_ENTRY
+    "[[lean_lib]]\n"
+    "name = \"Leanc\"\n"
+    "srcDir = \"${CMAKE_BINARY_DIR}/leanc\"\n"
+    "defaultFacets = [\"static\"]")
+  set(LAKE_LEANCHECKER_LIB_ENTRY [=[[[lean_lib]]
+name = "LeanChecker"
+defaultFacets = ["static"]]=])
+endif()
 if(USE_LAKE)
   configure_file(${LEAN_SOURCE_DIR}/lakefile.toml.in ${CMAKE_BINARY_DIR}/lakefile.toml)
   # copy for editing

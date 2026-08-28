@@ -22,7 +22,7 @@ Author: Leonardo de Moura
 #include "runtime/sstream.h"
 
 #ifndef LEAN_DEFAULT_THREAD_STACK_SIZE
-#ifdef LEAN_EMSCRIPTEN
+#if defined(LEAN_EMSCRIPTEN) || defined(__i386__) || defined(__wasm32__) || (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4)
 #define LEAN_DEFAULT_THREAD_STACK_SIZE 8*1024*1024 // 8MB for 32-bit
 #else
 #define LEAN_DEFAULT_THREAD_STACK_SIZE 1024*1024*1024 // 1GB for 64-bit
