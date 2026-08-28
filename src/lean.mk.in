@@ -32,7 +32,15 @@ EXTRA_SRC_ROOTS =
 # ignore error messages from missing parts, e.g. Leanc/
 SRCS = $(shell find $(PKG) $(PKG).lean $(EXTRA_SRC_ROOTS) -name '*.lean' 2> /dev/null)
 DEPS = $(addprefix $(TEMP_OUT)/,$(SRCS:.lean=.depend))
+ifdef LEAN_IMPORT_PATH
+ifneq ($(LEAN_PATH),)
+export LEAN_PATH := $(LEAN_IMPORT_PATH)@LEAN_PATH_SEPARATOR@$(LEAN_PATH)@LEAN_PATH_SEPARATOR@$(OLEAN_OUT)
+else
+export LEAN_PATH := $(LEAN_IMPORT_PATH)@LEAN_PATH_SEPARATOR@$(OLEAN_OUT)
+endif
+else
 export LEAN_PATH += @LEAN_PATH_SEPARATOR@$(OLEAN_OUT)
+endif
 OBJS = $(addprefix $(OLEAN_OUT)/, $(SRCS:.lean=.olean))
 ifdef C_ONLY
 # There are no .lean files in stage0/src/

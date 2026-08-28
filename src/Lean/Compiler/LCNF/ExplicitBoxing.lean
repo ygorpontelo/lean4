@@ -304,7 +304,7 @@ where
     | .uproj .. => return usize
     | .erased => return tagged
     | .lit (.nat n) =>
-      if n ≤ maxSmallNat then
+      if n ≤ (← getConfig).maxSmallNat then
         return tagged
       else
         return currentType

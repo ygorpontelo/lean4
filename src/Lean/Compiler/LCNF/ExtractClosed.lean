@@ -68,9 +68,9 @@ partial def shouldExtractLetValue (isRoot : Bool) (v : LetValue .pure) : M Bool 
   match v with
   | .lit (.str _) => return true
   | .lit (.nat v) =>
-    -- The old compiler's implementation used the runtime's `is_scalar` function, which
-    -- introduces a dependency on the architecture used by the compiler.
-    return !isRoot || v >= Nat.pow 2 63
+    -- Use the target pointer width to determine the scalar range, not a hardcoded
+    -- host architecture constant.
+    return !isRoot || v > (← getConfig).maxSmallNat
   | .lit _ | .erased => return !isRoot
   | .const name _ args =>
     if (← read).sccDecls.any (·.name == name) then

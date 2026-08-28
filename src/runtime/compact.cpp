@@ -14,6 +14,10 @@ Author: Leonardo de Moura
 #include "runtime/exception.h"
 #include "util/alloc.h"
 
+// Defined in ir_interpreter.cpp (namespace lean::ir); reverse-looks-up a function
+// address to its declared symbol name via the interpreter's symbol cache.
+namespace lean::ir { std::string lookup_symbol_name(void * addr); }
+
 #ifdef LEAN_WINDOWS
 #include <windows.h>  // must precede <psapi.h>: it relies on `WINBOOL`/`DWORD`/`WINAPI` from here
 #include <psapi.h>
@@ -100,6 +104,10 @@ LEAN_EXPORT std::vector<lib_info> get_loaded_libs() {
         if (!name) continue;
         libs.push_back({reinterpret_cast<size_t>(hdr), name});
     }
+#elif defined(__EMSCRIPTEN__)
+    // No dynamic-loader introspection under Emscripten. Closure saves on WASM use the
+    // cross-compile symbol-name table (flags bit 2), never the lib relocation table.
+    return libs;
 #else
     // Linux: use dl_iterate_phdr
     dl_iterate_phdr([](struct dl_phdr_info * info, size_t, void * data) -> int {
@@ -135,11 +143,12 @@ std::vector<lib_info> object_compactor::used_libs() const {
 }
 
 object_compactor::object_compactor(void * base_addr, std::vector<region_view> dep_regions,
-                                   bool allow_closures):
+                                   bool allow_closures, uint8 target_ptr_width):
     m_max_sharing_table(new max_sharing_table(this)),
     m_dep_regions(std::move(dep_regions)),
     m_libs(get_loaded_libs()),
     m_allow_closures(allow_closures),
+    m_target_ptr_width(target_ptr_width),
     m_base_addr(base_addr),
     m_begin(malloc(LEAN_COMPACTOR_INIT_SZ)),
     m_end(m_begin),
@@ -160,10 +169,31 @@ object_compactor::~object_compactor() {
 */
 object_offset g_null_offset = reinterpret_cast<object_offset>(static_cast<size_t>(-1) - 1);
 
+void object_compactor::write_tgt_size(void * ptr, size_t val, uint8 width) {
+    if (width == 4) {
+        uint32_t v = static_cast<uint32_t>(val);
+        memcpy(ptr, &v, sizeof(v));
+    } else {
+        memcpy(ptr, &val, sizeof(val));
+    }
+}
+
+void object_compactor::write_tgt_ptr(void * ptr, size_t val, uint8 width) {
+    write_tgt_size(ptr, val, width);
+}
+
+void object_compactor::emit_target_header(char * mem, object * o, size_t obj_sz, unsigned tag, unsigned other) {
+    memcpy(mem, o, sizeof(lean_object));
+    lean_set_non_heap_header(reinterpret_cast<lean_object*>(mem), obj_sz, tag, other);
+}
+
 void * object_compactor::alloc(size_t sz) {
-    size_t rem = sz % sizeof(void*);
+    // In cross-compile mode, align to the target pointer width so target struct
+    // offsets are correct. In native mode, align to host sizeof(void*) as before.
+    size_t align = is_cross_compile() ? m_target_ptr_width : sizeof(void*);
+    size_t rem = sz % align;
     if (rem != 0)
-        sz = sz + sizeof(void*) - rem;
+        sz = sz + align - rem;
     while (static_cast<char*>(m_end) + sz > m_capacity) {
         size_t new_capacity = capacity()*2;
         void * new_begin = malloc(new_capacity);
@@ -187,6 +217,10 @@ object_offset object_compactor::save(object * o, object * new_o) {
     return off;
 }
 
+// In cross-compile mode, `new_o` points to a target-layout serialization (not a native
+// struct). The `max_sharing_key` byte range and `memcmp` comparison operate on these
+// target-layout bytes, which correctly identifies structurally identical objects since
+// identical source objects produce identical target-layout bytes.
 object_offset object_compactor::save_max_sharing(object * o, object * new_o, size_t new_o_sz) {
     max_sharing_key k(reinterpret_cast<char*>(new_o) - reinterpret_cast<char*>(m_begin), new_o_sz);
     auto it = m_max_sharing_table->m_table.find(k);
@@ -201,6 +235,19 @@ object_offset object_compactor::save_max_sharing(object * o, object * new_o, siz
 
 object_offset object_compactor::to_offset(object * o) {
     if (lean_is_scalar(o)) {
+        if (is_cross_compile()) {
+            // Scalar promotion: a 64-bit-host scalar may exceed the 32-bit target's
+            // tagged range (SIZE_MAX>>1 at target width). Promote to boxed mpz.
+            size_t n = lean_unbox(o);
+            size_t tgt_max = (static_cast<size_t>(1) << (m_target_ptr_width * 8 - 1)) - 1;
+            if (n > tgt_max) {
+                // Create a boxed mpz for n and compact it
+                object * mpz_o = alloc_mpz(mpz::of_size_t(n));
+                object_offset off = compact(mpz_o);
+                lean_dec(mpz_o);
+                return off;
+            }
+        }
         return o;
     } else {
         auto it = m_obj_table.find(o);
@@ -267,6 +314,19 @@ object * object_compactor::copy_object(object * o, size_t sz) {
 object_offset object_compactor::insert_sarray(object * o) {
     size_t sz        = lean_sarray_size(o);
     unsigned elem_sz = lean_sarray_elem_size(o);
+    if (is_cross_compile()) {
+        // header(8B) + m_size(tgt) + m_capacity(tgt) + elem_sz*sz bytes (width-independent data)
+        size_t data_sz = elem_sz * sz;
+        size_t obj_sz = tgt_align(sizeof(lean_object) + 2 * tgt_ptr_sz() + data_sz);
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, LeanScalarArray, elem_sz);
+        char * p = mem + sizeof(lean_object);
+        write_tgt_size(p, sz, m_target_ptr_width);    p += tgt_ptr_sz();
+        write_tgt_size(p, sz, m_target_ptr_width);    p += tgt_ptr_sz();
+        memcpy(p, lean_to_sarray(o)->m_data, data_sz);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     size_t obj_sz = lean_usize_add_checked(sizeof(lean_sarray_object), lean_usize_mul_checked(elem_sz, sz));
     lean_sarray_object * new_o = (lean_sarray_object*)alloc(obj_sz);
     lean_set_non_heap_header_for_big((lean_object*)new_o, LeanScalarArray, elem_sz);
@@ -279,6 +339,19 @@ object_offset object_compactor::insert_sarray(object * o) {
 object_offset object_compactor::insert_string(object * o) {
     size_t sz        = lean_string_size(o);
     size_t len       = lean_string_len(o);
+    if (is_cross_compile()) {
+        // header(8B) + m_size(tgt) + m_capacity(tgt) + m_length(tgt) + sz bytes (width-independent data)
+        size_t obj_sz = tgt_align(sizeof(lean_object) + 3 * tgt_ptr_sz() + sz);
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, LeanString, 0);
+        char * p = mem + sizeof(lean_object);
+        write_tgt_size(p, sz, m_target_ptr_width);  p += tgt_ptr_sz();
+        write_tgt_size(p, sz, m_target_ptr_width);  p += tgt_ptr_sz();
+        write_tgt_size(p, len, m_target_ptr_width); p += tgt_ptr_sz();
+        memcpy(p, lean_to_string(o)->m_data, sz);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     size_t obj_sz = lean_usize_add_checked(sizeof(lean_string_object), sz);
     lean_string_object * new_o = (lean_string_object*)alloc(obj_sz);
     lean_set_non_heap_header_for_big((lean_object*)new_o, LeanString, 0);
@@ -302,6 +375,29 @@ object_offset object_compactor::insert_constructor(object * o) {
         object_offset c = to_offset(cnstr_get(o, i));
         m_tmp[base + i] = c;
     }
+    if (is_cross_compile()) {
+        // Target-layout: header (8B) + num_objs * tgt_ptr_sz + scalar data
+        // Constructors store object pointer slots followed by inline scalar data
+        // (UInt8/16/32/64, Bool, Float — all width-independent). The scalar region
+        // starts after the pointer slots and extends to the end of the host object.
+        size_t host_byte_sz = lean_object_byte_size(o);
+        size_t scalar_sz = host_byte_sz - sizeof(lean_object) - num_objs * sizeof(void*);
+        size_t data_sz = num_objs * tgt_ptr_sz() + scalar_sz;
+        size_t obj_sz = tgt_align(sizeof(lean_object) + data_sz);
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, lean_ptr_tag(o), lean_ptr_other(o));
+        char * slots = mem + sizeof(lean_object);
+        for (unsigned i = 0; i < num_objs; i++) {
+            write_tgt_ptr(slots + i * tgt_ptr_sz(),
+                          reinterpret_cast<size_t>(m_tmp[base + i]), m_target_ptr_width);
+        }
+        if (scalar_sz > 0) {
+            memcpy(slots + num_objs * tgt_ptr_sz(), lean_ctor_scalar_cptr(o), scalar_sz);
+        }
+        m_tmp.resize(base);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     object * new_o = copy_object(o);
     for (unsigned i = 0; i < num_objs; i++)
         lean_ctor_set(new_o, i, m_tmp[base + i]);
@@ -317,6 +413,23 @@ object_offset object_compactor::insert_array(object * o) {
         object_offset c = to_offset(array_get(o, i));
         m_tmp[base + i] = c;
     }
+    if (is_cross_compile()) {
+        // Target-layout: header(8B) + m_size(tgt) + m_capacity(tgt) + sz * tgt_ptr_sz
+        size_t data_sz = sz * tgt_ptr_sz();
+        size_t obj_sz = tgt_align(sizeof(lean_object) + 2 * tgt_ptr_sz() + data_sz);
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, LeanArray, 0);
+        char * p = mem + sizeof(lean_object);
+        write_tgt_size(p, sz, m_target_ptr_width);             p += tgt_ptr_sz();
+        write_tgt_size(p, sz, m_target_ptr_width);             p += tgt_ptr_sz();
+        for (size_t i = 0; i < sz; i++) {
+            write_tgt_ptr(p, reinterpret_cast<size_t>(m_tmp[base + i]), m_target_ptr_width);
+            p += tgt_ptr_sz();
+        }
+        m_tmp.resize(base);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     size_t obj_sz = lean_usize_add_checked(sizeof(lean_array_object), lean_usize_mul_checked(sizeof(void*), sz));
     lean_array_object * new_o = (lean_array_object*)alloc(obj_sz);
     lean_set_non_heap_header_for_big((lean_object*)new_o, LeanArray, 0);
@@ -330,6 +443,21 @@ object_offset object_compactor::insert_array(object * o) {
 
 object_offset object_compactor::insert_thunk(object * o) {
     object_offset c = to_offset(lean_thunk_get(o));
+    if (is_cross_compile()) {
+        // Compacted thunks must be evaluated (m_closure == null); the reader only
+        // fixes m_value, not m_closure.
+        lean_assert(lean_to_thunk(o)->m_closure == nullptr);
+        // header(8B) + m_value(tgt) + m_closure(tgt)
+        size_t obj_sz = tgt_align(sizeof(lean_object) + 2 * tgt_ptr_sz());
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, lean_ptr_tag(o), lean_ptr_other(o));
+        char * p = mem + sizeof(lean_object);
+        write_tgt_ptr(p, reinterpret_cast<size_t>(c), m_target_ptr_width);
+        p += tgt_ptr_sz();
+        write_tgt_ptr(p, 0, m_target_ptr_width); // m_closure (null)
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     size_t sz = sizeof(lean_thunk_object);
     object * r = copy_object(o, sz);
     lean_to_thunk(r)->m_value = c;
@@ -338,6 +466,15 @@ object_offset object_compactor::insert_thunk(object * o) {
 
 object_offset object_compactor::insert_ref(object * o) {
     object_offset c = to_offset(lean_to_ref(o)->m_value);
+    if (is_cross_compile()) {
+        // header(8B) + m_value(tgt)
+        size_t obj_sz = tgt_align(sizeof(lean_object) + tgt_ptr_sz());
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, lean_ptr_tag(o), lean_ptr_other(o));
+        write_tgt_ptr(mem + sizeof(lean_object), reinterpret_cast<size_t>(c), m_target_ptr_width);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save(o, new_o); // must NOT be max-shared
+    }
     size_t sz = sizeof(lean_ref_object);
     object * r = copy_object(o, sz);
     lean_to_ref(r)->m_value = c;
@@ -347,6 +484,18 @@ object_offset object_compactor::insert_ref(object * o) {
 
 object_offset object_compactor::insert_task(object * o) {
     object_offset c = to_offset(lean_task_get(o));
+    if (is_cross_compile()) {
+        // header(8B) + m_value(tgt) + m_imp(tgt, null in compacted)
+        size_t obj_sz = tgt_align(sizeof(lean_object) + 2 * tgt_ptr_sz());
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, lean_ptr_tag(o), lean_ptr_other(o));
+        char * p = mem + sizeof(lean_object);
+        write_tgt_ptr(p, reinterpret_cast<size_t>(c), m_target_ptr_width);
+        p += tgt_ptr_sz();
+        write_tgt_ptr(p, 0, m_target_ptr_width); // m_imp (null)
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     size_t sz = sizeof(lean_task_object);
     object * r = copy_object(o, sz);
     lean_assert(lean_to_task(r)->m_imp == nullptr);
@@ -367,6 +516,51 @@ object_offset object_compactor::insert_closure(object * o) {
         object_offset c = to_offset(lean_closure_arg_cptr(o)[i]);
         m_tmp[base + i] = c;
     }
+    if (is_cross_compile()) {
+        // Cross-compile: resolve m_fun to a symbol name. Try the declared-symbol
+        // registry first (covers all @[extern]/@[export] functions the interpreter
+        // has resolved), then fall back to dladdr (covers LEAN_EXPORT runtime fns).
+        void * fn = lean_closure_fun(o);
+        std::string sym_name = lean::ir::lookup_symbol_name(fn);
+        if (sym_name.empty()) {
+#if defined(__linux__) || defined(__APPLE__)
+            Dl_info info;
+            if (dladdr(fn, &info) && info.dli_sname) {
+                sym_name = info.dli_sname;
+            }
+#endif
+        }
+        if (sym_name.empty()) {
+            throw exception(std::string("Cross-compile closure: could not resolve symbol name for "
+                                        "function pointer. The function must be an exported symbol "
+                                        "(LEAN_EXPORT or default visibility) or an @[extern] "
+                                        "function resolved by the interpreter. Non-exported "
+                                        "@[extern] functions that were never called are not in "
+                                        "the registry; call the function once before saving."));
+        }
+        // Target layout: header(8B) + m_fun(tgt ptr) + m_arity(u16) + m_num_fixed(u16) + n * tgt_ptr
+        size_t obj_sz = tgt_align(sizeof(lean_object) + tgt_ptr_sz() + 2 * sizeof(uint16_t) + n * tgt_ptr_sz());
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, LeanClosure, 0);
+        char * p = mem + sizeof(lean_object);
+        write_tgt_ptr(p, 0, m_target_ptr_width);                  p += tgt_ptr_sz();  // m_fun = 0 (placeholder)
+        uint16_t arity = lean_closure_arity(o);
+        uint16_t num_fixed = lean_closure_num_fixed(o);
+        memcpy(p, &arity, sizeof(arity));                          p += sizeof(uint16_t);
+        memcpy(p, &num_fixed, sizeof(num_fixed));                  p += sizeof(uint16_t);
+        for (unsigned i = 0; i < n; i++) {
+            write_tgt_ptr(p, reinterpret_cast<size_t>(m_tmp[base + i]), m_target_ptr_width);
+            p += tgt_ptr_sz();
+        }
+        m_tmp.resize(base);
+        // Record the buffer-relative offset of the m_fun field and its symbol name.
+        size_t fn_field_off = (mem + sizeof(lean_object))
+                            - reinterpret_cast<char *>(m_begin);
+        m_closure_offsets.push_back(fn_field_off);
+        m_closure_symbols.push_back(sym_name);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     object * r = copy_object(o);
     for (unsigned i = 0; i < n; i++)
         lean_closure_arg_cptr(r)[i] = m_tmp[base + i];
@@ -381,6 +575,15 @@ object_offset object_compactor::insert_closure(object * o) {
 
 object_offset object_compactor::insert_promise(object * o) {
     object_offset c = to_offset((object *)lean_to_promise(o)->m_result);
+    if (is_cross_compile()) {
+        // header(8B) + m_result(tgt)
+        size_t obj_sz = tgt_align(sizeof(lean_object) + tgt_ptr_sz());
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, lean_ptr_tag(o), lean_ptr_other(o));
+        write_tgt_ptr(mem + sizeof(lean_object), reinterpret_cast<size_t>(c), m_target_ptr_width);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save_max_sharing(o, new_o, obj_sz);
+    }
     size_t sz = sizeof(lean_promise_object);
     object * r = copy_object(o, sz);
     lean_to_promise(r)->m_result = (lean_task_object *)c;
@@ -403,6 +606,33 @@ object_offset object_compactor::insert_mpz(object * o) {
     m._mp_alloc = nlimbs;
     return save(o, (lean_object*)new_o);
 #else
+    if (is_cross_compile()) {
+        // Target-layout mpz: header(8B) + mpz_struct(3*tgt_ptr_sz: m_sign + pad + m_size + m_digits) + data[]
+        size_t mpz_sz = 3 * tgt_ptr_sz(); // m_sign(1B+pad) + m_size(tgt) + m_digits(tgt)
+        size_t data_sz = lean_usize_mul_checked(sizeof(mpn_digit), to_mpz(o)->m_value.m_size);
+        size_t obj_sz = tgt_align(sizeof(lean_object) + mpz_sz + data_sz);
+        char * mem = (char*)alloc(obj_sz);
+        emit_target_header(mem, o, obj_sz, LeanMPZ, 0);
+        char * p = mem + sizeof(lean_object);
+        // m_sign at offset 0 (1 byte), padding to tgt_ptr_sz
+        *p = static_cast<char>(to_mpz(o)->m_value.m_sign ? 1 : 0);
+        p += tgt_ptr_sz(); // skip m_sign + padding
+        // m_size at tgt_ptr_sz
+        write_tgt_size(p, to_mpz(o)->m_value.m_size, m_target_ptr_width);
+        p += tgt_ptr_sz();
+        // m_digits at 2*tgt_ptr_sz — written as base-relative offset (filled after data is placed)
+        char * digits_field = p;
+        p += tgt_ptr_sz();
+        // data follows the mpz struct
+        memcpy(p, to_mpz(o)->m_value.m_digits, data_sz);
+        // m_digits = data_ptr - m_begin + m_base_addr (target-width pointer)
+        size_t digits_off = reinterpret_cast<size_t>(p) - reinterpret_cast<size_t>(m_begin)
+                          + reinterpret_cast<size_t>(m_base_addr);
+        lean_assert(digits_off < (static_cast<size_t>(1) << (m_target_ptr_width * 8)));
+        write_tgt_ptr(digits_field, digits_off, m_target_ptr_width);
+        object * new_o = reinterpret_cast<object*>(mem);
+        return save(o, new_o);
+    }
     size_t data_sz = lean_usize_mul_checked(sizeof(mpn_digit), to_mpz(o)->m_value.m_size);
     size_t sz      = lean_usize_add_checked(sizeof(mpz_object), data_sz);
     mpz_object * new_o = (mpz_object *)alloc(sz);
@@ -462,17 +692,23 @@ void object_compactor::operator()(object * o) {
     lean_assert(m_tmp.empty());
     // Allocate the root-address slot first (see below). We store an offset rather
     // than a pointer because `m_begin` may be reallocated while compacting `o`.
+    size_t root_slot_sz = is_cross_compile() ? tgt_ptr_sz() : sizeof(object_offset);
     size_t root_offset =
-      static_cast<char *>(alloc(sizeof(object_offset))) - static_cast<char *>(m_begin);
+      static_cast<char *>(alloc(root_slot_sz)) - static_cast<char *>(m_begin);
     object_offset off = to_offset(o);
-    object_offset * root = reinterpret_cast<object_offset *>(static_cast<char *>(m_begin) + root_offset);
-    *root = off;
+    char * root = static_cast<char *>(m_begin) + root_offset;
+    if (is_cross_compile()) {
+        write_tgt_ptr(root, reinterpret_cast<size_t>(off), m_target_ptr_width);
+    } else {
+        *reinterpret_cast<object_offset *>(root) = off;
+    }
 }
 
 region_reader::region_reader(size_t sz, void * data, void * base_addr,
                              std::vector<region_view> dep_regions,
                              std::vector<std::pair<size_t, ptrdiff_t>> lib_relocs,
-                             std::vector<size_t> closure_offsets):
+                             std::vector<size_t> closure_offsets,
+                             std::vector<void *> closure_fn_ptrs):
     m_size(sz),
     m_base_addr(base_addr),
     m_begin(data),
@@ -480,7 +716,8 @@ region_reader::region_reader(size_t sz, void * data, void * base_addr,
     m_end(static_cast<char*>(data)+sz),
     m_dep_regions(std::move(dep_regions)),
     m_lib_relocs(std::move(lib_relocs)),
-    m_closure_offsets(std::move(closure_offsets)) {
+    m_closure_offsets(std::move(closure_offsets)),
+    m_closure_fn_ptrs(std::move(closure_fn_ptrs)) {
     // Sort + overlap validation are deferred to `sort_and_validate_dep_regions()`: needed only
     // before the fixup walk; the fast path in `read()` skips both. Doing them eagerly here was
     // an O(N log N) per construction over a `dep_regions` array that grows linearly across
@@ -616,26 +853,38 @@ object * region_reader::read() {
     if (m_next == m_end)
         return nullptr; /* all objects have been read */
 
-    // Check if any closure fn ptr relocation is actually needed
-    bool needs_fn_reloc = false;
-    for (std::pair<size_t, ptrdiff_t> const & reloc : m_lib_relocs) {
-        if (reloc.second != 0) { needs_fn_reloc = true; break; }
-    }
-
-    // Apply closure fn-pointer relocations directly via the offset list rather than
-    // by scanning the compacted region for closure tags.
-    if (needs_fn_reloc && !m_closure_offsets.empty()) {
+    // Patch closure fn pointers. Two modes:
+    // 1. Symbol-resolved (cross-compile): m_closure_fn_ptrs has one resolved pointer per
+    //    closure; patch m_fun directly with the native pointer.
+    // 2. Lib-relocation (native): adjust m_fun by the delta between saved and current
+    //    library base addresses.
+    if (!m_closure_offsets.empty()) {
         char * begin = static_cast<char *>(m_begin);
-        for (size_t off : m_closure_offsets) {
-            void ** fn_field = reinterpret_cast<void **>(begin + off);
-            size_t fn = reinterpret_cast<size_t>(*fn_field);
-            std::vector<std::pair<size_t, ptrdiff_t>>::const_iterator upper =
-                std::upper_bound(m_lib_relocs.begin(), m_lib_relocs.end(), fn,
-                    [](size_t addr, std::pair<size_t, ptrdiff_t> const & e) { return addr < e.first; });
-            if (upper != m_lib_relocs.begin()) {
-                ptrdiff_t delta = (upper - 1)->second;
-                if (delta != 0)
-                    *fn_field = reinterpret_cast<void *>(static_cast<ptrdiff_t>(fn) + delta);
+        if (!m_closure_fn_ptrs.empty()) {
+            // Symbol-resolved: patch each closure's m_fun with the resolved pointer.
+            for (size_t i = 0; i < m_closure_offsets.size(); i++) {
+                void ** fn_field = reinterpret_cast<void **>(begin + m_closure_offsets[i]);
+                *fn_field = m_closure_fn_ptrs[i];
+            }
+        } else {
+            // Lib-relocation: apply base-address deltas.
+            bool needs_fn_reloc = false;
+            for (std::pair<size_t, ptrdiff_t> const & reloc : m_lib_relocs) {
+                if (reloc.second != 0) { needs_fn_reloc = true; break; }
+            }
+            if (needs_fn_reloc) {
+                for (size_t off : m_closure_offsets) {
+                    void ** fn_field = reinterpret_cast<void **>(begin + off);
+                    size_t fn = reinterpret_cast<size_t>(*fn_field);
+                    std::vector<std::pair<size_t, ptrdiff_t>>::const_iterator upper =
+                        std::upper_bound(m_lib_relocs.begin(), m_lib_relocs.end(), fn,
+                            [](size_t addr, std::pair<size_t, ptrdiff_t> const & e) { return addr < e.first; });
+                    if (upper != m_lib_relocs.begin()) {
+                        ptrdiff_t delta = (upper - 1)->second;
+                        if (delta != 0)
+                            *fn_field = reinterpret_cast<void *>(static_cast<ptrdiff_t>(fn) + delta);
+                    }
+                }
             }
         }
     }
@@ -684,5 +933,26 @@ object * region_reader::read() {
     }
     return root;
 }
+
+#ifdef LEAN_DEBUG
+// Self-check: compact a small object graph at target_ptr_width=4 on a 64-bit host
+// and verify the root offset and first object header are at the expected target-width
+// offsets. This is the smallest check that fails if the target-layout codec is broken.
+void cross_compile_self_check() {
+    if (sizeof(void*) != 8) return; // only meaningful on 64-bit host
+    object * s = lean_mk_string("test");
+    object_compactor compactor(nullptr, {}, false, 4);
+    compactor(s);
+    // Root offset should be 4 bytes (target ptr width)
+    char const * data = static_cast<char const *>(compactor.data());
+    uint32_t root_off;
+    memcpy(&root_off, data, 4);
+    lean_assert(root_off == 4); // root offset = tgt_ptr_sz (slot) + base_addr(0)
+    // The first object after the root slot should have a valid lean_object header
+    lean_object const * hdr = reinterpret_cast<lean_object const *>(data + root_off);
+    lean_assert(lean_ptr_tag(const_cast<lean_object*>(hdr)) == LeanString);
+    lean_dec(s);
+}
+#endif
 
 }

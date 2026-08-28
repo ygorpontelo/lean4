@@ -82,10 +82,10 @@ where resultTypeForArity (type : Lean.Expr) (arity : Nat) : Expr :=
     | .const ``lcErased _ => mkConst ``lcErased
     | _ => panic! "invalid arity"
 
-def litValueImpureType (v : LCNF.LitValue) : Expr :=
+def litValueImpureType (threshold : Nat) (v : LCNF.LitValue) : Expr :=
   match v with
   | .nat n =>
-    if n < UInt32.size then ImpureType.tagged else ImpureType.tobject
+    if n < threshold then ImpureType.tagged else ImpureType.tobject
   | .str .. => ImpureType.object
   | .uint8 .. => ImpureType.uint8
   | .uint16 .. => ImpureType.uint16
@@ -99,7 +99,7 @@ partial def lowerLet (decl : LetDecl .pure) (k : Code .pure) : ToImpureM (Code .
   let value ← normLetValue decl.value
   match value with
   | .lit litValue =>
-    let type := litValueImpureType litValue
+    let type := litValueImpureType (← getConfig).smallNatThreshold litValue
     let decl := ⟨decl.fvarId, decl.binderName, type, .lit litValue⟩
     continueLet decl
   | .proj typeName i fvarId =>

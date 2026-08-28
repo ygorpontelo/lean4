@@ -12,6 +12,7 @@ public import Lean.Compiler.IR.NormIds
 public import Lean.Compiler.IR.LLVMBindings
 import Lean.Compiler.LCNF.Types
 import Lean.Compiler.ModPkgExt
+import Lean.Compiler.Options
 import Lean.Runtime
 import Lean.Compiler.ClosedTermCache
 import Init.Data.Range.Polymorphic.Iterators
@@ -76,6 +77,7 @@ structure Context (llvmctx : LLVM.Context) where
   jpMap      : JPParamsMap := {}
   mainFn     : FunId := default
   mainParams : Array Param := #[]
+  opts       : Lean.Options := {}
   llvmmodule : LLVM.Module llvmctx
 
 structure State (llvmctx : LLVM.Context) where
@@ -626,7 +628,7 @@ def emitDec (builder : LLVM.Builder llvmctx)
 def emitNumLit (builder : LLVM.Builder llvmctx)
     (t : IRType) (v : Nat) : M llvmctx (LLVM.Value llvmctx) := do
   if t.isObj then
-    if v < UInt32.size then
+    if v < Lean.Compiler.targetSmallNatThreshold (← read).opts then
       callLeanUnsignedToNatFn builder v
     else
       callLeanCStrToNatFn builder v
@@ -1637,11 +1639,11 @@ partial def getModuleFunctions (mod : LLVM.Module llvmctx) : IO (Array (LLVM.Val
 `emitLLVM` is the entrypoint for the lean shell to code generate LLVM.
 -/
 @[export lean_ir_emit_llvm]
-def emitLLVM (env : Environment) (modName : Name) (filepath : String) : IO Unit := do
+def emitLLVM (env : Environment) (modName : Name) (filepath : String) (opts : Options := {}) : IO Unit := do
   LLVM.llvmInitializeTargetInfo
   let llvmctx ← LLVM.createContext
   let module ← LLVM.createModule llvmctx modName.toString
-  let emitLLVMCtx : EmitLLVM.Context llvmctx := {env := env, modName := modName, llvmmodule := module}
+  let emitLLVMCtx : EmitLLVM.Context llvmctx := {env := env, modName := modName, opts, llvmmodule := module}
   let initState := { var2val := default, jp2bb := default : EmitLLVM.State llvmctx}
   let out? ← ((EmitLLVM.main (llvmctx := llvmctx)).run initState).run emitLLVMCtx
   match out? with

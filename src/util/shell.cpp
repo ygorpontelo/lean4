@@ -194,6 +194,7 @@ static struct option g_long_options[] = {
     {"incr-save",    required_argument, 0, 'Y'},
     {"incr-load",    required_argument, 0, 'Z'},
     {"incr-header-save", required_argument, 0, 'H'},
+    {"target",       required_argument, 0, 'n'},
 #ifdef LEAN_DEBUG
     {"debug",        required_argument, 0, 'B'},
 #endif
@@ -201,7 +202,7 @@ static struct option g_long_options[] = {
 };
 
 static char const * g_opt_str =
-    "PdD:o:i:b:c:C:qgvVht:012j:012rR:M:012T:012ap:eE:Y:Z:H:"
+    "PdD:o:i:b:c:C:qgvVht:012j:012rR:M:012T:012ap:eE:Y:Z:H:n:"
 #if defined(LEAN_MULTI_THREAD)
     "s:012"
 #endif
@@ -240,7 +241,9 @@ bool process_shell_option(object_ref & shell_opts, int opt, char const * optarg,
         dec_ref(r);
         return false;
     } else {
-        rc = unbox(io_result_get_error(r));
+        rc = sizeof(void*) == 4
+            ? static_cast<int>(lean_ctor_get_uint32(io_result_get_error(r), 0))
+            : static_cast<int>(unbox(io_result_get_error(r)));
         dec_ref(r);
         return true;
     }

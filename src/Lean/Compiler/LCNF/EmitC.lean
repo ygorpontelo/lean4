@@ -699,8 +699,15 @@ where
       match v with
       | .uint8 v | .uint16 v | .uint32 v => emit v
       | .uint64 v => emit v; emit "ULL"
-      | .usize v => emit "((size_t)"; emit v; emit "ULL)"
+      | .usize v =>
+        let maxUSize := UInt64.ofNat (2 * (← getConfig).smallNatThreshold - 1)
+        if v > maxUSize then
+          throwError s!"usize literal {v} exceeds target size_t range (max {maxUSize})"
+        emit "((size_t)"; emit v; emit "ULL)"
       | .nat v =>
+        -- `lean_unsigned_to_nat` takes a C `unsigned` (32-bit), so the bound
+        -- is fixed by that API, not by the target pointer width. Larger
+        -- literals go through `lean_cstr_to_nat` (arbitrary precision).
         if v < UInt32.size then
           emit "lean_unsigned_to_nat("; emit v; emit "u)"
         else

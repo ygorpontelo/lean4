@@ -341,7 +341,7 @@ void print_value(tout const & ios, value const & v, type t) {
   return print_value(const_cast<tout &>(ios), v, t);
 }
 
-void * lookup_symbol_in_cur_exe(char const * sym) {
+LEAN_EXPORT void * lookup_symbol_in_cur_exe(char const * sym) {
 #ifdef LEAN_WINDOWS
     std::vector<HMODULE> hmods(128);
     DWORD bytes_needed;
@@ -389,6 +389,7 @@ void * lookup_symbol_in_cur_exe(char const * sym) {
 #endif
 }
 
+
 class interpreter;
 LEAN_THREAD_PTR(interpreter, g_interpreter);
 
@@ -402,7 +403,23 @@ struct native_symbol_cache_entry {
 // Caches native symbol lookup successes _and_ failures; we assume no native code is loaded or
 // unloaded after the interpreter is first invoked, so this can be a global cache.
 name_hash_map<native_symbol_cache_entry> * g_native_symbol_cache;
+// Reverse map: function address → resolved symbol name. Populated alongside
+// `g_native_symbol_cache` whenever `lookup_symbol` resolves an address via
+// `lookup_symbol_in_cur_exe`. Used by the cross-compile compactor to resolve
+// closure `m_fun` pointers to symbol names without relying on `dladdr`.
+lean::unordered_map<void*, std::string> * g_symbol_name_registry;
 std::shared_mutex * g_native_symbol_cache_mutex;
+
+// Reverse lookup: resolve a function address to its symbol name via the
+// declared-symbol registry. Thread-safe: acquires a shared lock on the
+// cache mutex since `lookup_symbol` inserts under the unique lock.
+std::string lookup_symbol_name(void * addr) {
+    if (!g_symbol_name_registry) return "";
+    std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
+    auto it = g_symbol_name_registry->find(addr);
+    if (it != g_symbol_name_registry->end()) return it->second;
+    return "";
+}
 
 class interpreter {
     // stack of IR variable slots
@@ -879,6 +896,7 @@ private:
             if (void *p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data())) {
                 e_new.m_native.m_addr = p_boxed;
                 e_new.m_native.m_boxed = true;
+                g_symbol_name_registry->insert({ p_boxed, std::string(boxed_mangled.data()) });
             } else {
                 // `@[export]` affects only the unboxed symbol name
                 if (optional<name> n = get_export_name_for(m_env, fn)) {
@@ -887,6 +905,7 @@ private:
                 if (void *p = lookup_symbol_in_cur_exe(mangled.data())) {
                     // if there is no boxed version, there are no unboxed parameters, so use default version
                     e_new.m_native.m_addr = p;
+                    g_symbol_name_registry->insert({ p, std::string(mangled.data()) });
                 }
             }
         }
@@ -1236,7 +1255,7 @@ extern "C" LEAN_EXPORT obj_res lean_run_mod_init_core(b_obj_arg  sym) {
     }
 }
 
-extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, object * decl, object * init_decl, object *) {
+extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, object * decl, object * init_decl) {
     return interpreter::with_interpreter<object *>(TO_REF(elab_environment, env), TO_REF(options, opts), TO_REF(name, decl), [&](interpreter & interp) {
         return interp.run_init(TO_REF(name, decl), TO_REF(name, init_decl));
     });
@@ -1254,11 +1273,13 @@ void initialize_ir_interpreter() {
         register_trace_class(*ir::g_interpreter_step);
     });
     ir::g_native_symbol_cache = new name_hash_map<ir::native_symbol_cache_entry>();
+    ir::g_symbol_name_registry = new lean::unordered_map<void*, std::string>();
     ir::g_native_symbol_cache_mutex = new std::shared_mutex();
 }
 
 void finalize_ir_interpreter() {
     delete ir::g_native_symbol_cache_mutex;
+    delete ir::g_symbol_name_registry;
     delete ir::g_native_symbol_cache;
     DEBUG_CODE({
         delete ir::g_interpreter_call;

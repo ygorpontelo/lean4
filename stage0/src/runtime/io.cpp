@@ -1429,6 +1429,9 @@ extern "C" LEAN_EXPORT obj_res lean_io_app_path() {
     object * appPathLean = mk_string(appPath);
     free(appPath);
     return io_result_mk_ok(appPathLean);
+#elif defined(LEAN_WASM_STANDALONE)
+    // No JS runtime in standalone WASM component mode; no app path available.
+    return io_result_mk_error("no app path in WASM component mode");
 #elif defined(LEAN_WASM_COMPONENT)
     // STANDALONE_WASM under Node.js: read __filename into a stack buffer
     // without using _malloc (not available as a JS global in this mode).

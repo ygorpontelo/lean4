@@ -48,7 +48,7 @@ Emits LLVM bitcode for the module.
 Before calling this function, the LLVM subsystem must first be successfully initialized.
 -/
 @[extern "lean_emit_llvm"]
-opaque emitLLVM (env : Environment) (modName : Name) (filepath : FilePath) : IO Unit
+opaque emitLLVM (env : Environment) (modName : Name) (filepath : FilePath) (opts : Lean.Options := {}) : IO Unit
 
 /-- Whether Lean was built with an address sanitizer enabled. -/
 @[extern "lean_internal_has_address_sanitizer"]
@@ -184,6 +184,7 @@ def displayHelp (useStderr : Bool) : IO Unit := do
   out.putStrLn    "                         EXPERIMENTAL: like `--incr-save`, but save only the header (state after importing)"
   if Internal.isDebug () then
     out.putStrLn  "      --debug=tag        enable assertions with the given tag"
+  out.putStrLn    "  -n, --target=32|64   target pointer width in bits for cross-compilation (default: host)"
   out.putStrLn    "      -D name=value      set a configuration option (see set_option command)"
 
 inductive ShellComponent
@@ -441,6 +442,15 @@ def ShellOptions.process (opts : ShellOptions)
     return {opts with incrLoadFileName? := ← checkOptArg "Z" optArg?}
   | 'H' => -- `--incr-header-save=file`
     return {opts with incrHeaderSaveFileName? := ← checkOptArg "H" optArg?}
+  | 'n' => -- `--target=32`/`--target=64` (target pointer width in bits)
+    let arg ← checkOptArg "n" optArg?
+    let some w := arg.toNat?
+      | do eprint s!"error: expected numeric argument for option '-n'\n"; throw 1
+    if w != 32 && w != 64 then
+      do eprint s!"error: invalid target pointer width `{arg}`, expected 32 or 64\n"; throw 1
+    let leanOpts := Compiler.compiler.target.ptrWidth.set opts.leanOpts w
+    let forwardedArgs := opts.forwardedArgs.push s!"-n{arg}"
+    return {opts with forwardedArgs, leanOpts}
   | _ =>
     pure ()
   eprint "Unknown command line option\n"
@@ -563,12 +573,12 @@ def shellMain (args : List String) (opts : ShellOptions) : IO UInt32 := do
       writeFileAtomically c fun out => do
         profileitIO "C code generation" opts.leanOpts do
           let data ← Compiler.LCNF.emitC mainModuleName
-            |>.toIO' { fileName, fileMap := default } { env }
+            |>.toIO' { fileName, fileMap := default, options := opts.leanOpts } { env }
           out.write data.toUTF8
     if let some bc := opts.bcFileName? then
       initLLVM
       profileitIO "LLVM code generation" opts.leanOpts do
-        emitLLVM env mainModuleName bc
+        emitLLVM env mainModuleName bc opts.leanOpts
   displayCumulativeProfilingTimes
   if Internal.hasAddressSanitizer () then
     return if env?.isSome then 0 else 1

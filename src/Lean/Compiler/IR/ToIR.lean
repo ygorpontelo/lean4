@@ -53,10 +53,10 @@ def bindErased (fvarId : FVarId) : M Unit := do
 def addDecl (d : Decl) : M Unit :=
   Lean.modifyEnv fun env => declMapExt.addEntry env d
 
-def lowerLitValue (v : LCNF.LitValue) : LitVal × IRType :=
+def lowerLitValue (threshold : Nat) (v : LCNF.LitValue) : LitVal × IRType :=
   match v with
   | .nat n =>
-    let type := if n < UInt32.size then .tagged else .tobject
+    let type := if n < threshold then .tagged else .tobject
     ⟨.num n, type⟩
   | .str s => ⟨.str s, .object⟩
   | .uint8 v => ⟨.num (UInt8.toNat v), .uint8⟩
@@ -134,7 +134,8 @@ partial def lowerLet (decl : LCNF.LetDecl .impure) (k : LCNF.Code .impure) : M F
     return .vdecl letVar type e (← lowerCode k)
   match decl.value with
   | .lit litValue =>
-    let ⟨litValue, _⟩ := lowerLitValue litValue
+    let threshold := Lean.Compiler.targetSmallNatThreshold (← getOptions)
+    let ⟨litValue, _⟩ := lowerLitValue threshold litValue
     continueLet (.lit litValue)
   | .oproj i var _ =>
     withGetFVarValue var fun var =>

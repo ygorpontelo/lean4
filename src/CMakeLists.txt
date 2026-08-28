@@ -112,7 +112,8 @@ option(USE_GMP "USE_GMP" ON)
 # When ON, build against whatever GMP is available even if it is older than 6.3.0.
 option(FORCE_GMP "Build against the available GMP even if older than the required 6.3.0" OFF)
 option(USE_MIMALLOC "use mimalloc" ON)
-option(LEAN_WASM_COMPONENT "Build for WASM component model (STANDALONE_WASM, no pthreads)" OFF)
+option(LEAN_WASM_COMPONENT "Build Lean compiler for WASM via Emscripten (NODERAWFS, pthread)" OFF)
+option(LEAN_WASM_STANDALONE "Build runtime for WASM component model (STANDALONE_WASM, no pthread, exnref exceptions)" OFF)
 set(LEAN_MI_SECURE 0 CACHE STRING "Configure mimalloc memory safety mitigations (https://github.com/microsoft/mimalloc/blob/v2.2.7/include/mimalloc/types.h#L56-L60)")
 
 # development-specific options
@@ -170,6 +171,9 @@ if(CHECK_OLEAN_VERSION MATCHES "ON")
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+  if(LEAN_WASM_STANDALONE AND LEAN_WASM_COMPONENT)
+    message(FATAL_ERROR "LEAN_WASM_STANDALONE and LEAN_WASM_COMPONENT are mutually exclusive")
+  endif()
   # TODO(WN): code size/performance tradeoffs
   # - we're using -O3; it's /okay/
   # - -Oz produces quite slow code
@@ -178,10 +182,19 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
 
   # From https://emscripten.org/docs/compiling/WebAssembly.html#backends:
   # > The simple and safe thing is to pass all -s flags at both compile and link time.
-  if(LEAN_WASM_COMPONENT)
-    # WASM component mode: NODERAWFS for node.js filesystem access.
-    # Use -pthread with PTHREAD_POOL_SIZE for the Lean task manager.
-    # STANDALONE_WASM is incompatible with NODERAWFS; use NODERAWFS for testing under node.js.
+  if(LEAN_WASM_STANDALONE)
+    # Standalone runtime for WASM component model: STANDALONE_WASM with no
+    # pthreads.  Uses the new exnref exception model (WASM_LEGACY_EXCEPTIONS=0)
+    # which wasmtime and the component model support, unlike the legacy EH
+    # proposal that -fwasm-exceptions emits by default.  The task manager is
+    # created with 0 workers (no background threads); all IO must complete
+    # synchronously.
+    set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -s WASM_LEGACY_EXCEPTIONS=0 -s STANDALONE_WASM")
+    string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN -D LEAN_WASM_COMPONENT -D LEAN_WASM_STANDALONE ${EMSCRIPTEN_SETTINGS}")
+  elseif(LEAN_WASM_COMPONENT)
+    # Compiler build for running under Node.js: NODERAWFS for real filesystem
+    # access, -pthread with PTHREAD_POOL_SIZE for the Lean task manager, and
+    # -fwasm-exceptions for C++ exception support.
     set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -s PTHREAD_POOL_SIZE=4 -s NODERAWFS")
     string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
     string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN -D LEAN_WASM_COMPONENT -D LEAN_MULTI_THREAD ${EMSCRIPTEN_SETTINGS}")
@@ -191,8 +204,16 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
     string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN ${EMSCRIPTEN_SETTINGS}")
   endif()
   string(APPEND LEAN_EXTRA_LINKER_FLAGS " ${EMSCRIPTEN_SETTINGS}")
+  # Cross-compile stdlib oleans to 32-bit target width. The 64-bit host lean
+  # reads 64-bit oleans from the previous stage for import resolution during
+  # elaboration, while writing 32-bit-layout oleans to this build's output
+  # directory. LEAN_IMPORT_PATH (set below, after CMAKE_RELATIVE_LIBRARY_OUTPUT_DIRECTORY
+  # is defined) points the reader at the previous stage's 64-bit oleans so the
+  # two-pass approach works: the reader only ever sees same-width (64-bit) oleans.
+  if(LEAN_WASM_COMPONENT AND STAGE GREATER 0 AND PREV_STAGE)
+    string(APPEND LEAN_EXTRA_OPTS " --target=32")
+  endif()
 endif()
-
 # Added for CTest
 include(CTest)
 
@@ -217,6 +238,11 @@ endif()
 
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${CMAKE_RELATIVE_LIBRARY_OUTPUT_DIRECTORY}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/lean")
+# Cross-compile: point the olean reader at the previous stage's 64-bit oleans
+# so the 64-bit host lean can import them while writing 32-bit oleans here.
+if(LEAN_WASM_COMPONENT AND STAGE GREATER 0 AND PREV_STAGE)
+  set(LEAN_IMPORT_PATH "${PREV_STAGE}/${CMAKE_RELATIVE_LIBRARY_OUTPUT_DIRECTORY}")
+endif()
 
 # OSX default thread stack size is very small. Moreover, in Debug mode, each new stack frame consumes a lot of extra memory.
 if((MULTI_THREAD MATCHES "ON") AND (CMAKE_SYSTEM_NAME MATCHES "Darwin"))
@@ -914,6 +940,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   # We set `ERROR_ON_UNDEFINED_SYMBOLS=0` because our build of LibUV does not
   # define all symbols, see the comment about LibUV on WebAssembly further up
   # in this file.
+  # LEAN_WASM_STANDALONE only produces runtime libraries; the lean exe is
+  # not built in that mode.  If it were, the else() branch below would set
+  # MAIN_MODULE=1 which is incompatible with STANDALONE_WASM.
   if(LEAN_WASM_COMPONENT)
     # WASM component mode: use EM_ASM to look up symbols in the wasm export
     # table instead of dlsym (which requires MAIN_MODULE=1). Export all

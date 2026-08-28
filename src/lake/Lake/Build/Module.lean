@@ -987,7 +987,7 @@ def Module.buildLean
   let arts := mod.mkArtifacts presetup.srcFile presetup.isModule
   mod.clearOutputArtifacts
   compileLeanModule presetup.srcFile relSrcFile setup mod.setupFile arts args
-    (← getLeanPath) (← getLean) (← getLeanir)
+    ((← getEnvLeanPath) ++ (← getLeanPath)) (← getLean) (← getLeanir)
   mod.clearOutputHashes
   mod.computeArtifacts setup.isModule
 

@@ -112,7 +112,8 @@ option(USE_GMP "USE_GMP" ON)
 # When ON, build against whatever GMP is available even if it is older than 6.3.0.
 option(FORCE_GMP "Build against the available GMP even if older than the required 6.3.0" OFF)
 option(USE_MIMALLOC "use mimalloc" ON)
-set(LEAN_MI_SECURE 0 CACHE STRING "Configure mimalloc memory safety mitigations (https://github.com/microsoft/mimalloc/blob/v2.2.7/include/mimalloc/types.h#L56-L60)")
+option(LEAN_WASM_COMPONENT "Build Lean compiler for WASM via Emscripten (NODERAWFS, pthread)" OFF)
+option(LEAN_WASM_STANDALONE "Build runtime for WASM component model (STANDALONE_WASM, no pthread, exnref exceptions)" OFF)
 
 # development-specific options
 option(CHECK_OLEAN_VERSION "Only load .olean files compiled with the current version of Lean" OFF)
@@ -169,6 +170,9 @@ if(CHECK_OLEAN_VERSION MATCHES "ON")
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+  if(LEAN_WASM_STANDALONE AND LEAN_WASM_COMPONENT)
+    message(FATAL_ERROR "LEAN_WASM_STANDALONE and LEAN_WASM_COMPONENT are mutually exclusive")
+  endif()
   # TODO(WN): code size/performance tradeoffs
   # - we're using -O3; it's /okay/
   # - -Oz produces quite slow code
@@ -177,9 +181,18 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
 
   # From https://emscripten.org/docs/compiling/WebAssembly.html#backends:
   # > The simple and safe thing is to pass all -s flags at both compile and link time.
-  set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -flto")
-  string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
-  string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN ${EMSCRIPTEN_SETTINGS}")
+  if(LEAN_WASM_STANDALONE)
+    set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -s WASM_LEGACY_EXCEPTIONS=0 -s STANDALONE_WASM")
+    string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN -D LEAN_WASM_COMPONENT -D LEAN_WASM_STANDALONE ${EMSCRIPTEN_SETTINGS}")
+  elseif(LEAN_WASM_COMPONENT)
+    set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -s PTHREAD_POOL_SIZE=4 -s NODERAWFS")
+    string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
+    string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN -D LEAN_WASM_COMPONENT -D LEAN_MULTI_THREAD ${EMSCRIPTEN_SETTINGS}")
+  else()
+    set(EMSCRIPTEN_SETTINGS "-s ALLOW_MEMORY_GROWTH=1 -fwasm-exceptions -pthread -flto")
+    string(APPEND LEANC_EXTRA_CC_FLAGS " -pthread")
+    string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_EMSCRIPTEN ${EMSCRIPTEN_SETTINGS}")
+  endif()
   string(APPEND LEAN_EXTRA_LINKER_FLAGS " ${EMSCRIPTEN_SETTINGS}")
 endif()
 
@@ -904,6 +917,9 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
   # We set `ERROR_ON_UNDEFINED_SYMBOLS=0` because our build of LibUV does not
   # define all symbols, see the comment about LibUV on WebAssembly further up
   # in this file.
+  # LEAN_WASM_STANDALONE only produces runtime libraries; the lean exe is
+  # not built in that mode.  If it were, the MAIN_MODULE=1 below would be
+  # incompatible with STANDALONE_WASM.
   string(
     APPEND LEAN_EXE_LINKER_FLAGS
     " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} ${EMSCRIPTEN_SETTINGS} -lnodefs.js -s EXIT_RUNTIME=1 -s MAIN_MODULE=1 -s LINKABLE=1 -s EXPORT_ALL=1 -s ERROR_ON_UNDEFINED_SYMBOLS=0"

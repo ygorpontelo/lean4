@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.Data.Options
+public import Lean.Compiler.Options
 
 public section
 
@@ -48,6 +49,12 @@ structure ConfigOptions where
   Insert reset-reuse instructions.
   -/
   resetReuse : Bool := true
+  /--
+  Target pointer width in bits (32 or 64) for cross-compilation. Defaults to the host width.
+  Controls the scalar threshold and the on-disk olean layout so a host `lean` can emit
+  target-correct oleans for a different pointer width.
+  -/
+  targetPtrWidth : Nat := System.Platform.numBits
   deriving Inhabited
 
 register_builtin_option compiler.small : Nat := {
@@ -93,6 +100,16 @@ def toConfigOptions (opts : Options) : ConfigOptions := {
   extractClosed := compiler.extract_closed.get opts
   maxRecSpecialize := compiler.maxRecSpecialize.get opts
   resetReuse := compiler.reuse.get opts
+  targetPtrWidth := Lean.Compiler.compiler.target.ptrWidth.get opts
 }
+
+/-- The maximum tagged `Nat` value for the target pointer width: `2^(ptrWidth-1) - 1`. -/
+def ConfigOptions.maxSmallNat (cfg : ConfigOptions) : Nat :=
+  2 ^ (cfg.targetPtrWidth - 1) - 1
+
+/-- The exclusive upper bound for tagged `Nat` values for the target pointer width: `2^(ptrWidth-1)`.
+Duplicated by `Lean.Compiler.targetSmallNatThreshold` for CoreM callers; the two must stay in sync. -/
+def ConfigOptions.smallNatThreshold (cfg : ConfigOptions) : Nat :=
+  2 ^ (cfg.targetPtrWidth - 1)
 
 end Lean.Compiler.LCNF

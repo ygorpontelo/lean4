@@ -1771,11 +1771,12 @@ duplicated. Thus the data cannot be loaded with individual `readModuleData` call
 passing (a prefix of) the file names to `readModuleDataParts`. `mod` is used to determine an
 arbitrary but deterministic base address for `mmap`.
 -/
-def saveModuleDataParts (mod : Name) (parts : Array (System.FilePath × ModuleData)) : IO Unit := do
+def saveModuleDataParts (mod : Name) (parts : Array (System.FilePath × ModuleData))
+    (targetPtrWidth : UInt8 := (System.Platform.numBits / 8).toUInt8) : IO Unit := do
   let mut cs : Option Compactor := none
   for h : i in [:parts.size] do
     let (fname, data) := parts[i]
-    cs := some (← unsafe CompactedRegion.save fname mod data #[] cs)
+    cs := some (← unsafe CompactedRegion.save fname mod data #[] cs (targetPtrWidth := targetPtrWidth))
 
 /--
 Loads the module data from the given file names. The files must be (a prefix of) the result of a
@@ -1790,9 +1791,9 @@ def readModuleDataParts (fnames : Array System.FilePath) :
     result := result.push part
     depRegions := depRegions.push part.2
   return result
-
-def saveModuleData (fname : System.FilePath) (mod : Name) (data : ModuleData) : IO Unit := do
-  let _ ← unsafe CompactedRegion.save fname mod data #[] none
+def saveModuleData (fname : System.FilePath) (mod : Name) (data : ModuleData)
+    (targetPtrWidth : UInt8 := (System.Platform.numBits / 8).toUInt8) : IO Unit := do
+  let _ ← unsafe CompactedRegion.save fname mod data #[] none (targetPtrWidth := targetPtrWidth)
 
 def readModuleData (fname : @& System.FilePath) : IO (ModuleData × CompactedRegion) :=
   unsafe CompactedRegion.read fname #[]
@@ -1900,7 +1901,8 @@ private def mkIRData (env : Environment) : ModuleData :=
     extraConstNames := getIRExtraConstNames env .private (includeDecls := true)
   }
 
-def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true) : IO Unit := do
+def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true)
+    (targetPtrWidth : UInt8 := (System.Platform.numBits / 8).toUInt8) : IO Unit := do
   if env.header.isModule then
     let extEntries ← computeExtEntries env
     let mkPart (level : OLeanLevel) :=
@@ -1908,15 +1910,15 @@ def writeModule (env : Environment) (fname : System.FilePath) (writeIR := true) 
     saveModuleDataParts env.mainModule #[
       (← mkPart .exported),
       (← mkPart .server),
-      (← mkPart .private)]
+      (← mkPart .private)] (targetPtrWidth := targetPtrWidth)
     if writeIR then
       let irData := mkIRData env
       -- Make sure to change the module name so we derive a different base address
       saveModuleDataParts (env.mainModule ++ `ir) #[
         (fname.withExtension "ir.sig", default),  -- to be filled by leanir instead
-        (fname.withExtension "ir", irData)]
+        (fname.withExtension "ir", irData)] (targetPtrWidth := targetPtrWidth)
   else
-    saveModuleData fname env.mainModule (← mkModuleData env)
+    saveModuleData fname env.mainModule (← mkModuleData env) (targetPtrWidth := targetPtrWidth)
 
 /--
 Construct a mapping from persistent extension name to extension index at the array of persistent extensions.
@@ -2106,6 +2108,13 @@ private def readIRPartsOfMod (mod : Name) : IO (Array (ModuleData × CompactedRe
   let ir ← unsafe CompactedRegion.read (α := ModuleData) irFile #[irSig.2]
   return #[irSig, ir]
 
+private partial def containsSubstr (haystack : String) (needle : String) (i : String.Pos.Raw) : Bool :=
+  String.Internal.isPrefixOf needle (String.Internal.extract haystack i (String.Pos.Raw.mk (String.Internal.length haystack)))
+    || (!String.Internal.atEnd haystack i && containsSubstr haystack needle (String.Pos.Raw.next haystack i))
+
+private def isPtrWidthError (e : IO.Error) : Bool :=
+  containsSubstr (toString e) "ptr_width" ⟨0⟩
+
 partial def importModulesCore
     (imports : Array Import) (globalLevel : OLeanLevel := .private)
     (arts : NameMap ImportArtifacts := {}) (isExported : Bool := globalLevel < .private)
@@ -2232,18 +2241,32 @@ where
   -- .olean + .olean.server (optional) + .olean.private (optional)
   loadData i := do
     if let some arts := arts.find? i.module then
-      -- Opportunistically load all available parts.
-      -- Producer (e.g., Lake) should limit parts to the proper import level.
-      let fnames := arts.oleanParts (inServer := globalLevel ≥ .server)
-      readModuleDataParts fnames
+      -- Pre-resolved paths from the build system (e.g., Lake). Fall back to
+      -- search-path lookup if the artifacts are unreadable (e.g., cross-compile
+      -- where workspace output oleans have a different ptr_width than the host).
+      try
+        let fnames := arts.oleanParts (inServer := globalLevel ≥ .server)
+        readModuleDataParts fnames
+      catch e =>
+        -- Fall back only on ptr_width mismatch (cross-compile), not on
+        -- corruption or githash errors, which should surface to the user.
+        if isPtrWidthError e then
+          readModuleDataPartsOfMod i.module
+        else
+          throw e
     else
       readModuleDataPartsOfMod i.module
   -- .ir.sig + .ir (optional)
   loadIR i := do
     if let some arts := arts.find? i.module then
-      -- Opportunistically load all available parts.
-      -- Producer (e.g., Lake) should limit parts to the proper import level.
-      readModuleDataParts arts.irParts
+      -- Fall back to search-path lookup on read error (see `loadData`).
+      try
+        readModuleDataParts arts.irParts
+      catch e =>
+        if isPtrWidthError e then
+          readIRPartsOfMod i.module
+        else
+          throw e
     else
       readIRPartsOfMod i.module
 

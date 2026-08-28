@@ -44,10 +44,10 @@ extern "C" LEAN_EXPORT obj_res lean_init_llvm() {
     return initialize_Lean_Compiler_IR_EmitLLVM(/*builtin*/ false);
 }
 
-/*  emitLLVM (env : Environment) (modName : Name) (filepath : FilePath) : IO Unit */
-extern "C" obj_res lean_ir_emit_llvm(obj_arg env, obj_arg mod_name, obj_arg filepath);
-extern "C" LEAN_EXPORT obj_res lean_emit_llvm(obj_arg env, obj_arg mod_name, obj_arg filepath) {
-    return lean_ir_emit_llvm(env, mod_name, filepath);
+/*  emitLLVM (env : Environment) (modName : Name) (filepath : FilePath) (opts : Options) : IO Unit */
+extern "C" obj_res lean_ir_emit_llvm(obj_arg env, obj_arg mod_name, obj_arg filepath, obj_arg opts);
+extern "C" LEAN_EXPORT obj_res lean_emit_llvm(obj_arg env, obj_arg mod_name, obj_arg filepath, obj_arg opts) {
+    return lean_ir_emit_llvm(env, mod_name, filepath, opts);
 }
 }
 

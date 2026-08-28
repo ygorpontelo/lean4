@@ -45,7 +45,9 @@ template<typename T> T get_io_scalar_result(object * o) {
         string_ref error(lean_io_error_to_string(err_obj));
         throw exception(error.to_std_string());
     } else {
-        T r = unbox(io_result_get_value(o));
+        T r = sizeof(void*) == 4
+            ? reinterpret_cast<T>(lean_ctor_get_uint32(io_result_get_value(o), 0))
+            : unbox(io_result_get_value(o));
         dec(o);
         return r;
     }

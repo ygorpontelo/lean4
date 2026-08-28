@@ -58,6 +58,16 @@ Authors: Leonardo de Moura, Gabriel Ebner, Sebastian Ullrich
 #endif
 
 namespace lean {
+// Defined in ir_interpreter.cpp (namespace lean::ir); resolves a symbol name to a native
+// function pointer via dlsym (Linux/macOS) or EM_ASM (Emscripten/WASM).
+namespace ir { void * lookup_symbol_in_cur_exe(char const * sym); }
+namespace ir { std::string lookup_symbol_name(void * addr); }
+
+#ifdef LEAN_DEBUG
+// Self-check for the target-layout compaction codec, defined in `compact.cpp`.
+// Called once on the first `lean_compacted_region_save` in debug builds.
+void cross_compile_self_check();
+#endif
 
 namespace {
 /** Read up to `n` bytes from `fd` into `buf`, handling `EINTR`. */
@@ -108,12 +118,18 @@ struct olean_header {
     // 5 bytes: magic number
     char marker[5] = {'o', 'l', 'e', 'a', 'n'};
     // 1 byte: version, incremented on structural changes to header
-    // v2: current `.olean` format
-    // v3: new format used for `CompactedRegion.save (allowClosures := true)`; see below for changes
+    // v2: current `.olean` format (version byte only, host-width data section)
+    // v3: extended format used for `CompactedRegion.save (allowClosures := true)`
+    // The data section layout is target-width when the ptr-width flag bits (below) indicate a
+    // width different from `sizeof(void*)` (cross-compile), native when equal.
     uint8_t version;
     // 1 byte of flags:
     // * bit 0: whether persisted bignums use GMP or Lean-native encoding
-    // * bit 1-7: reserved
+    // * bit 1: whether the file has closure sections (data_size + closures + lib table)
+    // * bit 2: whether closure sections use symbol-name table (cross-compile) instead of
+    //          lib relocation table (native). Only set when bit 1 is also set.
+    // * bits 3-4: target pointer width of the data section: 00 = 8 bytes, 01 = 4 bytes.
+    // * bits 5-7: reserved
     uint8_t flags =
 #ifdef LEAN_USE_GMP
         0b1;
@@ -132,12 +148,16 @@ struct olean_header {
     // Use fixed 64-bit width so .olean files are cross-architecture compatible.
     uint64_t base_addr;
     // In v3, the fixed header is followed by these length-prefixed sections:
-    //   size_t   data_size                                // byte length of the compacted data
+    //   uint64_t data_size                               // byte length of the compacted data
     //   compacted data                                    // `data_size` bytes
     //   uint32_t num_closure_offsets
     //   num_closure_offsets × uint64_t                    // data-relative closure `m_fun` offsets
     //   uint32_t num_libs                                 // closure fn-pointer relocation table
-    //   num_libs × (size_t base_addr, uint32_t id_len, char id[id_len])  // used libs
+    //   num_libs × (uint64_t base_addr, uint32_t id_len, char id[id_len])  // used libs
+    // When flags bit 2 is set (cross-compile symbol table), the lib table is replaced by:
+    //   uint32_t num_symbols                               // symbol-name table
+    //   num_symbols × (uint32_t sym_len, char sym_name[sym_len])           // exported symbol names
+    // The reader resolves each symbol name via dlsym/lookup_symbol_in_cur_exe.
     // In v2, the compacted data starts immediately after the header (no `data_size`, no sections).
     size_t data[];
 };
@@ -167,10 +187,10 @@ static void ensure_compactor_class() {
 }
 
 static lean_object * mk_compactor(void * base_addr, std::vector<region_view> dep_regions,
-                                  bool allow_closures) {
+                                  bool allow_closures, uint8 target_ptr_width) {
     ensure_compactor_class();
     return lean_alloc_external(g_compactor_class,
-        new object_compactor(base_addr, std::move(dep_regions), allow_closures));
+        new object_compactor(base_addr, std::move(dep_regions), allow_closures, target_ptr_width));
 }
 
 static object_compactor * to_compactor(lean_object * o) {
@@ -213,7 +233,8 @@ static void write_lib_table(std::ostream & out, std::vector<lib_info> const & li
     uint32_t n = libs.size();
     out.write(reinterpret_cast<char const *>(&n), sizeof(n));
     for (lib_info const & lib : libs) {
-        out.write(reinterpret_cast<char const *>(&lib.base_addr), sizeof(lib.base_addr));
+        uint64_t base_addr = lib.base_addr;
+        out.write(reinterpret_cast<char const *>(&base_addr), sizeof(base_addr));
         uint32_t len = lib.id.size();
         out.write(reinterpret_cast<char const *>(&len), sizeof(len));
         out.write(lib.id.data(), len);
@@ -223,7 +244,7 @@ static void write_lib_table(std::ostream & out, std::vector<lib_info> const & li
 static size_t lib_table_size(std::vector<lib_info> const & libs) {
     size_t sz = sizeof(uint32_t); // num_libs
     for (lib_info const & lib : libs) {
-        sz += sizeof(size_t) + sizeof(uint32_t) + lib.id.size();
+        sz += sizeof(uint64_t) + sizeof(uint32_t) + lib.id.size();
     }
     return sz;
 }
@@ -239,9 +260,10 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
     if (n == 0) return relocs;
     std::vector<lib_info> current_libs = get_loaded_libs();
     for (uint32_t i = 0; i < n; i++) {
-        size_t old_base;
-        memcpy(&old_base, p, sizeof(old_base));
-        p += sizeof(old_base);
+        uint64_t old_base_u64;
+        memcpy(&old_base_u64, p, sizeof(old_base_u64));
+        p += sizeof(old_base_u64);
+        size_t old_base = static_cast<size_t>(old_base_u64);
         uint32_t len;
         memcpy(&len, p, sizeof(len));
         p += sizeof(len);
@@ -268,11 +290,14 @@ static std::vector<std::pair<size_t, ptrdiff_t>> read_lib_table_from_buffer(char
 
 extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_obj_arg mod, b_obj_arg odata,
                                                            b_obj_arg odep_regions, obj_arg oprev,
-                                                           uint8 allow_closures_u8) {
+                                                           uint8 allow_closures_u8, uint8 target_ptr_width) {
     // `mmap` addresses must be page-aligned. The default (non-huge) page size on x86-64 is 4KB;
     // `MapViewOfFileEx` addresses must be aligned to the "memory allocation granularity" (64KB).
     const size_t ALIGN = 1LL<<16;
     bool allow_closures = allow_closures_u8 != 0;
+#ifdef LEAN_DEBUG
+    { static bool checked = false; if (!checked) { checked = true; cross_compile_self_check(); } }
+#endif
 
     option_ref<object_ref> prev(oprev);
     object_ref cs_obj;
@@ -287,15 +312,14 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
         // algorithm, the mixing of multiple `Name` parts seems to result in a nicely distributed
         // 64-bit output.
         size_t base_addr = name(mod, true).hash();
-        // x86-64 user space is currently limited to the lower 47 bits
-        // (https://en.wikipedia.org/wiki/X86-64#Virtual_address_space_details).
-        // On Linux at least, the stack grows down from ~0x7fff... followed by shared libraries,
-        // so reserve a bit of space for them (0x7fff...-0x7f00... = 1TB).
-        base_addr = base_addr % 0x7f0000000000;
+        // Constrain to the target's address space. For 32-bit targets, use the lower 31 bits
+        // (0x7f000000); for 64-bit, use the lower 47 bits (0x7f0000000000).
+        size_t addr_space = target_ptr_width == 4 ? 0x7f000000 : 0x7f0000000000;
+        base_addr = base_addr % addr_space;
         base_addr = base_addr & ~(ALIGN - 1);
         std::vector<region_view> dep_regions = extract_dep_regions(odep_regions);
         cs_obj = object_ref(mk_compactor(reinterpret_cast<void *>(base_addr),
-                                         std::move(dep_regions), allow_closures));
+                                         std::move(dep_regions), allow_closures, target_ptr_width));
     }
 
     object_compactor & compactor = *to_compactor(cs_obj.raw());
@@ -315,7 +339,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
         std::ofstream out(olean_tmp_fn, std::ios_base::binary);
 
         if (!allow_closures) {
-            // v2 path: just `[header][data]`, no extension, no trailer.
+            // v2 path (no closures): just `[header][data]`, no extension, no trailer.
             // Compactor errors on closures.
             if (compactor.size() % ALIGN != 0) {
                 compactor.alloc(ALIGN - (compactor.size() % ALIGN));
@@ -327,6 +351,9 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             compactor.alloc(sizeof(olean_header));
             olean_header header = {};
             header.version = 2;
+            if (target_ptr_width == 4) {
+                header.flags |= 0b1000; // bits 3-4 = 01: target pointer width is 4 bytes
+            }
             header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
             strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
             strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
@@ -336,7 +363,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             out.write(static_cast<char const *>(compactor.data()) + file_offset + sizeof(olean_header),
                       compactor.size() - file_offset - sizeof(olean_header));
         } else {
-            // v3 format
+            // v3 format (with closures)
             // NOTE: each section's data MUST be reserved in the compactor buffer, even when
             // trailing the actual compactor data, so that any follow-up compaction stays in sync
             // instead of attempting to map on top of the trailing data
@@ -348,27 +375,36 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             compactor.alloc(sizeof(olean_header));
             olean_header header = {};
             header.version = 3;
+            header.flags |= 0b10; // bit 1: has closure sections
+            bool is_cross_compile = target_ptr_width != sizeof(void*);
+            if (is_cross_compile) {
+                header.flags |= 0b100; // bit 2: symbol-name table (cross-compile)
+            }
+            if (target_ptr_width == 4) {
+                header.flags |= 0b1000; // bits 3-4 = 01: target pointer width is 4 bytes
+            }
             header.base_addr = reinterpret_cast<size_t>(compactor.base_addr()) + file_offset;
             strncpy(header.lean_version, get_short_version_string().c_str(), sizeof(header.lean_version));
             strncpy(header.githash, LEAN_GITHASH, sizeof(header.githash));
             out.write(reinterpret_cast<char *>(&header), sizeof(header));
 
             // `data_size`: reserve its slot now so the data lands at the right buffer offset (and
-            // stays `size_t`-aligned: 88 + 8 = 96); its value is only known once the data is
+            // stays `uint64_t`-aligned); its value is only known once the data is
             // serialized, so it is written just below.
-            compactor.alloc(sizeof(size_t));
+            compactor.alloc(sizeof(uint64_t));
 
             compactor(odata);
 
-            size_t data_offset = file_offset + sizeof(olean_header) + sizeof(size_t);
-            size_t data_size = compactor.size() - data_offset;
+            size_t data_offset = file_offset + sizeof(olean_header) + sizeof(uint64_t);
+            uint64_t data_size = compactor.size() - data_offset;
             out.write(reinterpret_cast<char const *>(&data_size), sizeof(data_size));
             out.write(static_cast<char const *>(compactor.data()) + data_offset, data_size);
 
             // Read everything we need from the compactor buffer now: the trailer `alloc`s below
             // may reallocate it. `used_libs()` maps each recorded closure fn pointer to its
             // library; only those libraries are written. `file_offsets` are this part's closure
-            // `m_fun` offsets made data-section-relative.
+            // `m_fun` offsets made data-section-relative. `used_libs()` must be computed BEFORE
+            // `all_offsets` is cleared: it reads the raw `m_fun` pointers through those offsets.
             std::vector<lib_info> used_libs = compactor.used_libs();
             std::vector<size_t> & all_offsets = compactor.closure_offsets();
             std::vector<uint64_t> file_offsets;
@@ -378,7 +414,7 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
             // Clear so a chained next part accumulates only its own closures.
             all_offsets.clear();
 
-            // Closure section.
+            // Closure offset section.
             uint32_t num_closure_offsets = static_cast<uint32_t>(file_offsets.size());
             compactor.alloc(sizeof(num_closure_offsets));
             out.write(reinterpret_cast<char const *>(&num_closure_offsets), sizeof(num_closure_offsets));
@@ -388,9 +424,25 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_save(b_obj_arg ofname, b_o
                           file_offsets.size() * sizeof(uint64_t));
             }
 
-            // Relocation table: only the libraries containing a compacted closure's fn pointer.
-            compactor.alloc(lib_table_size(used_libs));
-            write_lib_table(out, used_libs);
+            if (is_cross_compile) {
+                // Symbol-name table: one name per closure, resolved by the reader via dlsym.
+                std::vector<std::string> & symbols = compactor.closure_symbols();
+                uint32_t num_symbols = static_cast<uint32_t>(symbols.size());
+                compactor.alloc(sizeof(num_symbols));
+                out.write(reinterpret_cast<char const *>(&num_symbols), sizeof(num_symbols));
+                for (auto const & sym : symbols) {
+                    uint32_t sym_len = static_cast<uint32_t>(sym.size());
+                    compactor.alloc(sizeof(sym_len));
+                    out.write(reinterpret_cast<char const *>(&sym_len), sizeof(sym_len));
+                    compactor.alloc(sym_len);
+                    out.write(sym.data(), sym_len);
+                }
+                symbols.clear();
+            } else {
+                // Relocation table: only the libraries containing a compacted closure's fn pointer.
+                compactor.alloc(lib_table_size(used_libs));
+                write_lib_table(out, used_libs);
+            }
         }
         out.close();
         // Note that close itself can fail to flush, so this must be last.
@@ -488,12 +540,17 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             || memcmp(header.marker, default_header.marker, sizeof(header.marker)) != 0) {
             return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', invalid header").str());
         }
-        if ((header.version != 2 && header.version != 3) || header.flags != default_header.flags
+        uint8 header_ptr_width = (header.flags & 0b11000u) == 0b1000 ? 4 : 8;
+        if ((header.version != 2 && header.version != 3)
+            || (header.flags & ~0b1111u) != (default_header.flags & ~0b1111u)
+            || header_ptr_width != sizeof(void*)
 #ifdef LEAN_CHECK_OLEAN_VERSION
             || strncmp(header.githash, LEAN_GITHASH, sizeof(header.githash)) != 0
 #endif
         ) {
-            return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', incompatible header").str());
+            return io_result_mk_error((sstream() << "failed to read file '" << olean_fn << "', incompatible header"
+                << " (version " << (unsigned)header.version << ", ptr_width " << (unsigned)header_ptr_width
+                << ", expected " << sizeof(void*) << ")").str());
         }
         char * base_addr = reinterpret_cast<char *>(header.base_addr);
 
@@ -575,15 +632,15 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
 #endif
         }
 
-        // v3 format, default data otherwise
         std::vector<std::pair<size_t, ptrdiff_t>> lib_relocs;
         std::vector<size_t> closure_offsets;
+        std::vector<void *> closure_fn_ptrs;
         size_t data_section_off = sizeof(olean_header);
         size_t data_section_sz = size - sizeof(olean_header);
-        if (header.version == 3) {
-            size_t data_size;
+        if (header.flags & 0b10) {  // v3 with closure sections
+            uint64_t data_size;
             memcpy(&data_size, buffer + sizeof(olean_header), sizeof(data_size));
-            data_section_off = sizeof(olean_header) + sizeof(size_t);
+            data_section_off = sizeof(olean_header) + sizeof(uint64_t);
             data_section_sz = data_size;
             char const * p = buffer + data_section_off + data_size;
             uint32_t num_closure_offsets;
@@ -597,7 +654,28 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
                     p += sizeof(off);
                     closure_offsets.push_back(static_cast<size_t>(off));
                 }
-                lib_relocs = read_lib_table_from_buffer(p);
+                if (header.flags & 0b100) {
+                    // Cross-compile symbol table: resolve each symbol name to a fn pointer.
+                    uint32_t num_symbols;
+                    memcpy(&num_symbols, p, sizeof(num_symbols));
+                    p += sizeof(num_symbols);
+                    closure_fn_ptrs.reserve(num_symbols);
+                    for (uint32_t i = 0; i < num_symbols; i++) {
+                        uint32_t sym_len;
+                        memcpy(&sym_len, p, sizeof(sym_len));
+                        p += sizeof(sym_len);
+                        std::string sym_name(p, sym_len);
+                        p += sym_len;
+                        void * addr = ir::lookup_symbol_in_cur_exe(sym_name.c_str());
+                        if (!addr) {
+                            throw exception(sstream() << "failed to resolve closure symbol '"
+                                                      << sym_name << "' in current binary");
+                        }
+                        closure_fn_ptrs.push_back(addr);
+                    }
+                } else {
+                    lib_relocs = read_lib_table_from_buffer(p);
+                }
             }
         }
 
@@ -605,7 +683,8 @@ extern "C" LEAN_EXPORT object * lean_compacted_region_read(b_obj_arg ofname, b_o
             data_section_sz, buffer + data_section_off,
             base_addr + data_section_off,
             std::move(dep_regions),
-            std::move(lib_relocs), std::move(closure_offsets));
+            std::move(lib_relocs), std::move(closure_offsets),
+            std::move(closure_fn_ptrs));
         object * mod = reader.read();
         object * pair = alloc_cnstr(0, 2, 0);
         cnstr_set(pair, 0, mod);

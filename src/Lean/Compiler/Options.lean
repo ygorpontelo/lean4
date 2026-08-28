@@ -51,4 +51,15 @@ register_builtin_option compiler.inLeanIR : Bool := {
   descr := "Internal. Indicates whether the compiler is currently running in `leanir`."
 }
 
+register_builtin_option compiler.target.ptrWidth : Nat := {
+  defValue := System.Platform.numBits
+  descr := "(compiler) target pointer width in bits (32 or 64) for cross-compilation. Defaults to the host width."
+}
+
+/-- The exclusive upper bound for tagged `Nat` values at the target pointer width: `2^(ptrWidth-1)`.
+Readable from `CoreM` without depending on `Lean.Compiler.LCNF.ConfigOptions`. This duplicates
+`LCNF.ConfigOptions.smallNatThreshold`; the two must stay in sync (same formula, same option key). -/
+def targetSmallNatThreshold (opts : Options) : Nat :=
+  2 ^ (compiler.target.ptrWidth.get opts - 1)
+
 end Lean.Compiler

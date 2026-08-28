@@ -93,7 +93,8 @@ cannot enforce; see `Compactor`.
 @[extern "lean_compacted_region_save"]
 public unsafe opaque CompactedRegion.save {α : Type} (fname : @& System.FilePath) (key : @& Name)
     (data : @& α) (depRegions : @& Array CompactedRegion) (prev : Option Compactor)
-    (allowClosures := false) : IO Compactor
+    (allowClosures := false) (targetPtrWidth := System.Platform.numBits / 8 |>.toUInt8)
+    : IO Compactor
 
 /--
 Reads a compacted region from disk.

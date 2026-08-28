@@ -790,7 +790,9 @@ class task_manager {
         lean_task_imp* imp = t->m_imp.load(std::memory_order_relaxed);
         lean_assert(imp);
         unsigned prio = imp->m_prio;
-        if (prio == LEAN_SYNC_PRIO) {
+        // With 0 workers (LEAN_WASM_STANDALONE), run all tasks inline to
+        // avoid deadlocks in wait_any/wait_for.
+        if (prio == LEAN_SYNC_PRIO || m_max_std_workers == 0) {
             run_task(lock, t);
             return;
         }
@@ -1105,6 +1107,10 @@ extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
     if (num_workers > 0) {
         g_task_manager = new task_manager(num_workers);
     }
+#elif defined(LEAN_WASM_STANDALONE)
+    // Single-threaded component: 0 workers so IO.Promise/CancelToken can be
+    // constructed. Tasks run inline via enqueue_core.
+    g_task_manager = new task_manager(0);
 #endif
 }
 

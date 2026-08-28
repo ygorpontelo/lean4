@@ -383,6 +383,7 @@ def runFrontend
       let commandLints := collectCommandLints snaps none #[]
       let env ← Linter.recordLints inputCtx.fileMap env commandLints
       writeModule (writeIR := !Compiler.compiler.postponeCompile.get finalOpts) env oleanFileName
+        (targetPtrWidth := (Compiler.compiler.target.ptrWidth.get finalOpts / 8).toUInt8)
 
   if let some ileanFileName := ileanFileName? then
     let trees := snaps.getAll.flatMap (match ·.infoTree? with | some t => #[t] | _ => #[])

@@ -51,7 +51,13 @@ class LEAN_EXPORT object_compactor {
     std::vector<lib_info> m_libs;
     // Buffer-relative byte offsets of every compacted closure's `m_fun` field
     std::vector<size_t> m_closure_offsets;
+    // Symbol names for cross-compile closures, parallel to `m_closure_offsets`.
+    // Empty for native builds; populated with `dladdr` results in cross-compile mode.
+    std::vector<std::string> m_closure_symbols;
     bool m_allow_closures = false;
+    // Target pointer width in bytes (4 for 32-bit, 8 for 64-bit). When different from
+    // `sizeof(void*)`, the writer emits target-width struct layouts instead of native ones.
+    uint8 m_target_ptr_width = sizeof(void*);
     // On-disk base address used for `mmap`ing compacted regions without relocations
     // References within the compacted region are rewritten by subtracting `m_begin` and adding `m_base_addr`
     // In the simplest case `base_addr == nullptr`, we get region-relative pointers
@@ -60,6 +66,23 @@ class LEAN_EXPORT object_compactor {
     void * m_end;
     void * m_capacity;
     size_t capacity() const { return static_cast<char*>(m_capacity) - static_cast<char*>(m_begin); }
+    // True when the compactor emits target-width (cross-compile) layouts.
+    bool is_cross_compile() const { return m_target_ptr_width != sizeof(void*); }
+    // Target pointer width in bytes (4 or 8).
+    size_t tgt_ptr_sz() const { return m_target_ptr_width; }
+    // Align a byte size to the target pointer width.
+    size_t tgt_align(size_t sz) const {
+        size_t rem = sz % m_target_ptr_width;
+        return rem == 0 ? sz : sz + m_target_ptr_width - rem;
+    }
+    // Write a native `size_t` value at target width (4 or 8 bytes) into the buffer at `ptr`.
+    static void write_tgt_size(void * ptr, size_t val, uint8 width);
+    // Same as `write_tgt_size`; the name documents intent (pointer/offset vs length).
+    static void write_tgt_ptr(void * ptr, size_t val, uint8 width);
+    // Copy the 8-byte `lean_object` header from `o` into `mem` and set the non-heap
+    // header fields for a target-layout object of `obj_sz` bytes. Used by every
+    // cross-compile `insert_*` path.
+    static void emit_target_header(char * mem, object * o, size_t obj_sz, unsigned tag, unsigned other);
     object_offset save(object * o, object * new_o);
     object_offset save_max_sharing(object * o, object * new_o, size_t new_o_sz);
     object_offset to_offset(object * o);
@@ -80,7 +103,7 @@ class LEAN_EXPORT object_compactor {
     object_offset insert_closure(object * o);
 public:
     object_compactor(void * base_addr = nullptr, std::vector<region_view> dep_regions = {},
-                     bool allow_closures = false);
+                     bool allow_closures = false, uint8 target_ptr_width = sizeof(void*));
     object_compactor(object_compactor const &) = delete;
     object_compactor(object_compactor &&) = delete;
     ~object_compactor();
@@ -98,6 +121,8 @@ public:
     std::vector<lib_info> used_libs() const;
     /** Buffer-relative offsets of all closure `m_fun` fields compacted so far. */
     std::vector<size_t> & closure_offsets() { return m_closure_offsets; }
+    /** Symbol names for cross-compile closures, parallel to `closure_offsets()`. */
+    std::vector<std::string> & closure_symbols() { return m_closure_symbols; }
 };
 
 // A transient, non-owning read context: it walks a just-mapped buffer to fix up its pointers
@@ -120,6 +145,10 @@ class LEAN_EXPORT region_reader {
     // Data-relative byte offsets of every closure's `m_fun` field. Used to patch fn
     // pointers on load without scanning the compacted region. Empty if no closures.
     std::vector<size_t> m_closure_offsets;
+    // Resolved function pointers for cross-compile closures, parallel to `m_closure_offsets`.
+    // When non-empty, `read()` patches each closure's `m_fun` with the corresponding pointer
+    // directly, bypassing `m_lib_relocs` (which is used for native lib-base relocation).
+    std::vector<void *> m_closure_fn_ptrs;
     void sort_and_validate_dep_regions();
     void move(size_t d);
     void move(object * o);
@@ -133,12 +162,11 @@ class LEAN_EXPORT region_reader {
     void fix_mpz(object * o);
     void fix_closure(object * o);
 public:
-    /* Creates a read context over the given just-mapped buffer. Does not take ownership of the
-       buffer; see the class comment. */
     region_reader(size_t sz, void * data, void * base_addr,
                   std::vector<region_view> dep_regions = {},
                   std::vector<std::pair<size_t, ptrdiff_t>> lib_relocs = {},
-                  std::vector<size_t> closure_offsets = {});
+                  std::vector<size_t> closure_offsets = {},
+                  std::vector<void *> closure_fn_ptrs = {});
     region_reader(region_reader const &) = delete;
     region_reader(region_reader &&) = delete;
     region_reader operator=(region_reader const &) = delete;
